@@ -79,7 +79,7 @@ graph LR
 ### 1. Clone the Repo
 
 ```bash
-git clone https://github.com/yourusername/DeceptiNet.git
+git clone https://github.com/hafedh049/DeceptiNet.git
 cd DeceptiNet
 ```
 
@@ -158,8 +158,8 @@ Distributed under the **MIT License**. See `LICENSE` for more information.
 
 ## 📬 Contact
 
-**Hafedh Guenichi** — [your.email@example.com](mailto:your.email@example.com)  
-Project Link: [https://github.com/yourusername/DeceptiNet](https://github.com/yourusername/DeceptiNet)
+**Hafedh Guenichi** — [your.email@example.com](mailto:hafedhgunichi@gmail.com)  
+Project Link: [https://github.com/yourusername/DeceptiNet](https://github.com/hafedh049/DeceptiNet)
 
 ---
 
