@@ -1,0 +1,88 @@
+---
+- name: Install Docker and deploy Grafana + Loki
+  hosts: Red-Blue
+  gather_facts: true
+
+  vars:
+    docker_network: "monitoring_net"
+    grafana_container_name: "grafana"
+    grafana_image: "grafana/grafana:latest"
+    grafana_port: 3000
+    loki_container_name: "loki"
+    loki_image: "grafana/loki:2.9.2"
+    loki_port: 3100
+    grafana_provisioning_dir: "/opt/grafana/provisioning"
+    grafana_datasource_file: "/opt/grafana/provisioning/datasources/loki-datasource.yml"
+    logs_path: "/var/log"
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Packages
+      apt:
+        name:
+          - docker.io
+          - python3-pip
+        state: present
+
+    - name: Ensure Docker service is running
+      systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Install Docker Python module for Ansible
+      pip:
+        name: docker
+        state: present
+        extra_args: --break-system-packages
+
+    - name: Create monitoring Docker network
+      community.docker.docker_network:
+        name: "{{ docker_network }}"
+        state: present
+
+    - name: Create Grafana provisioning directories
+      file:
+        path: "{{ grafana_provisioning_dir }}/datasources"
+        state: directory
+        recurse: yes
+
+    - name: Create Loki datasource provisioning file
+      copy:
+        dest: "{{ grafana_datasource_file }}"
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Loki
+              type: loki
+              access: proxy
+              url: http://{{ loki_container_name }}:3100
+              isDefault: true
+              editable: true
+
+    - name: Run Loki container
+      community.docker.docker_container:
+        name: "{{ loki_container_name }}"
+        image: "{{ loki_image }}"
+        state: started
+        restart_policy: always
+        networks:
+          - name: "{{ docker_network }}"
+        published_ports:
+          - "{{ loki_port }}:3100"
+
+    - name: Run Grafana container with provisioning mounted
+      community.docker.docker_container:
+        name: "{{ grafana_container_name }}"
+        image: "{{ grafana_image }}"
+        state: started
+        restart_policy: always
+        networks:
+          - name: "{{ docker_network }}"
+        published_ports:
+          - "{{ grafana_port }}:3000"
+        volumes:
+          - "{{ grafana_provisioning_dir }}:/etc/grafana/provisioning"

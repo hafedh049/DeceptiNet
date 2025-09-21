@@ -1,0 +1,21 @@
+---
+- name: Remove HashiCorp Boundary (Single VM)
+  hosts: HashiCorp
+  tasks:
+    - name: Stop and remove Docker Compose stack
+      community.docker.docker_compose:
+        project_src: "/opt/boundary"
+        state: absent
+        remove_images: all # fixed from True
+        remove_volumes: yes # 'yes' works for volumes
+        remove_orphans: yes
+
+    - name: Remove Boundary configuration directory
+      file:
+        path: "/opt/boundary"
+        state: absent
+
+    - name: Remove Vault init file (if exists)
+      file:
+        path: "/root/vault-init.json"
+        state: absent

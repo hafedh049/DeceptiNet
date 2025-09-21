@@ -1,0 +1,179 @@
+---
+- name: Deploy HashiCorp Boundary (Single VM)
+  hosts: HashiCorp
+  vars:
+    boundary_version: "0.9.0"
+    postgres_user: "postgres"
+    postgres_password: "postgres"
+    postgres_db: "boundary"
+    boundary_pg_url: "postgresql://{{ postgres_user }}:{{ postgres_password }}@db/{{ postgres_db }}?sslmode=disable"
+    boundary_addr: "{{ ansible_default_ipv4.address }}"
+
+  tasks:
+    - name: Install Docker & Docker Compose plugin
+      package:
+        name:
+          - docker.io*
+          - docker-compose*
+        state: present
+
+    - name: Ensure docker service is running
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Create directories for Boundary config
+      file:
+        path: "/opt/boundary"
+        state: directory
+        mode: "0755"
+
+    - name: Read Vault root token from JSON file
+      ansible.builtin.command: cat /root/vault-init.json
+      register: vault_init_file
+      no_log: true
+
+    - name: Set Vault root token
+      set_fact:
+        vault_root_token: "{{ vault_init_file.stdout | from_json | json_query('root_token') }}"
+      no_log: true
+
+    - name: Enable Vault Transit Engine
+      ansible.builtin.command: vault secrets enable transit
+      environment:
+        VAULT_ADDR: "http://{{ boundary_addr }}:8200"
+        VAULT_TOKEN: "{{ vault_root_token }}"
+      ignore_errors: true
+
+    - name: Generate AEAD keys using Vault
+      shell: |
+        vault write -format=json transit/keys/boundary_root type="aes256-gcm96"
+        vault write -format=json transit/keys/boundary_worker_auth type="aes256-gcm96"
+        vault write -format=json transit/keys/boundary_recovery type="aes256-gcm96"
+      environment:
+        VAULT_ADDR: "http://{{ boundary_addr }}:8200"
+        VAULT_TOKEN: "{{ vault_root_token }}"
+      ignore_errors: true
+
+    - name: Create boundary.hcl
+      copy:
+        dest: "/opt/boundary/boundary.hcl"
+        content: |
+          disable_mlock = true
+
+          controller {
+            name = "single-controller"
+            description = "Controller + Worker in one VM"
+            database {
+                url = "{{ boundary_pg_url }}"
+            }
+          }
+
+          worker {
+            name = "single-worker"
+            description = "Worker in same VM"
+            public_addr = "{{ boundary_addr }}"
+          }
+
+          listener "tcp" {
+            address = "{{ boundary_addr }}"
+            purpose = "api"
+            tls_disable = true
+          }
+
+          listener "tcp" {
+            address = "{{ boundary_addr }}"
+            purpose = "cluster"
+            tls_disable = true
+          }
+
+          listener "tcp" {
+            address = "{{ boundary_addr }}"
+            purpose = "proxy"
+            tls_disable = true
+          }
+
+          # Static keys for demo
+          kms "aead" {
+            purpose = "root"
+            aead_type = "aes-gcm"
+            key = "sP1fnF5Xz85RrXyELHFeZg9Ad2qt4Z4bgNHVGtD6ung="
+            key_id = "global_root"
+          }
+
+          kms "aead" {
+            purpose = "worker-auth"
+            aead_type = "aes-gcm"
+            key = "8fZBjCUfN0TzjEGLQldGY4+iE9AkOvCfjh7+p0GtRBQ="
+            key_id = "global_worker-auth"
+          }
+
+          kms "aead" {
+            purpose = "recovery"
+            aead_type = "aes-gcm"
+            key = "8fZBjCUfN0TzjEGLQldGY4+iE9AkOvCfjh7+p0GtRBQ="
+            key_id = "global_recovery"
+          }
+
+    - name: Create Docker Compose file
+      copy:
+        dest: "/opt/boundary/docker-compose.yml"
+        content: |
+          version: "3.8"
+
+          services:
+            db:
+              image: postgres:11
+              ports:
+                - "5432:5432"
+              environment:
+                - POSTGRES_DB={{ postgres_db }}
+                - POSTGRES_USER={{ postgres_user }}
+                - POSTGRES_PASSWORD={{ postgres_password }}
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U {{ postgres_user }}"]
+                interval: 3s
+                timeout: 5s
+                retries: 5
+
+            db-init:
+              image: hashicorp/boundary:{{ boundary_version }}
+              command: ["database", "init", "-config", "/boundary/boundary.hcl"]
+              volumes:
+                - "/opt/boundary:/boundary:ro,z"
+              environment:
+                - BOUNDARY_PG_URL={{ boundary_pg_url }}
+              cap_add:
+                - IPC_LOCK
+              depends_on:
+                db:
+                  condition: service_healthy
+
+            boundary:
+              image: hashicorp/boundary:{{ boundary_version }}
+              command: ["server", "-config", "/boundary/boundary.hcl"]
+              cap_add:
+                - IPC_LOCK
+              volumes:
+                - "/opt/boundary:/boundary/"
+              ports:
+                - "9200:9200"
+                - "9201:9201"
+                - "9202:9202"
+              environment:
+                - BOUNDARY_PG_URL={{ boundary_pg_url }}
+                - HOSTNAME={{ boundary_addr }}
+              depends_on:
+                db-init:
+                  condition: service_completed_successfully
+              healthcheck:
+                test: ["CMD", "wget", "-O-", "http://{{ boundary_addr }}:9200"]
+                interval: 3s
+                timeout: 5s
+                retries: 5
+
+    - name: Launch Boundary stack using docker-compose plugin
+      command: docker compose -f /opt/boundary/docker-compose.yml up -d
+      args:
+        chdir: /opt/boundary

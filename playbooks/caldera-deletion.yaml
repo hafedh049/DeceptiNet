@@ -1,0 +1,33 @@
+---
+- name: Uninstall MITRE CALDERA
+  hosts: Red-Blue
+  gather_facts: false
+  vars:
+    caldera_dir: /opt/caldera
+
+  tasks:
+    - name: Stop CALDERA service if running
+      systemd:
+        name: caldera
+        state: stopped
+        enabled: no
+      ignore_errors: true
+
+    - name: Disable and remove CALDERA systemd service
+      file:
+        path: /etc/systemd/system/caldera.service
+        state: absent
+
+    - name: Reload systemd after removing service
+      systemd:
+        daemon_reload: yes
+        daemon_reexec: yes
+
+    - name: Kill any stray CALDERA processes
+      shell: "pkill -f '{{ caldera_dir }}/server.py'"
+      ignore_errors: true
+
+    - name: Remove CALDERA directory
+      file:
+        path: "{{ caldera_dir }}"
+        state: absent

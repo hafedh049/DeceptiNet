@@ -1,0 +1,26 @@
+[
+    {
+        "name": "Ansible",
+        "path": "D:/Virtual Machines/Ansible\\Ansible.vmx",
+        "ip": "192.168.74.142",
+        "state": "start"
+    },
+    {
+        "name": "T-POT",
+        "path": "D:/Virtual Machines/T-POT\\T-POT.vmx",
+        "ip": "192.168.74.253",
+        "state": "start"
+    },
+    {
+        "name": "Red-Blue",
+        "path": "D:/Virtual Machines/Red-Blue\\Red-Blue.vmx",
+        "ip": "192.168.74.147",
+        "state": "start"
+    },
+    {
+        "name": "HashiCorp",
+        "path": "D:/Virtual Machines/HashiCorp\\HashiCorp.vmx",
+        "ip": "192.168.74.111",
+        "state": "start"
+    }
+]
