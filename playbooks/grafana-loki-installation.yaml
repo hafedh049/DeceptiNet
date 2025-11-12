@@ -1,0 +1,742 @@
+---
+- name: Deploy Grafana + Loki + Alertmanager Stack (Podman)
+  hosts: Blue
+  vars:
+    grafana_user: "{{ GRAFANA_USER }}"
+    grafana_password: "{{ GRAFANA_PASSWORD }}"
+    grafana_port: "{{ GRAFANA_PORT }}"
+    grafana_image: "{{ GRAFANA_IMAGE }}"
+    grafana_container_name: "{{ GRAFANA_CONTAINER_NAME }}"
+    grafana_host: "{{ GRAFANA_HOST }}"
+
+    loki_port: "{{ LOKI_PORT }}"
+    loki_image: "{{ LOKI_IMAGE }}"
+    loki_container_name: "{{ LOKI_CONTAINER_NAME }}"
+
+    alertmanager_port: "{{ ALERTMANAGER_PORT }}"
+    alertmanager_image: "{{ ALERTMANAGER_IMAGE }}"
+    alertmanager_container_name: "{{ ALERTMANAGER_CONTAINER_NAME }}"
+
+    n8n_host: "{{ N8N_IP }}"
+    n8n_port: "{{ N8N_PORT }}"
+    n8n_user: "{{ N8N_USER }}"
+    n8n_pass: "{{ N8N_PASSWORD }}"
+
+  tasks:
+    - name: Install Podman and dependencies
+      dnf:
+        name:
+          - podman
+          - podman-compose
+          - python3-pip
+        state: present
+
+    - name: Install setuptools
+      pip:
+        name: setuptools
+        extra_args: --break-system-packages
+
+    - name: Ensure logging directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - /opt/logging
+        - /opt/logging/loki/chunks
+        - /opt/logging/loki/index
+        - /opt/logging/loki/cache
+        - /opt/logging/loki/wal
+        - /opt/logging/loki/compactor
+        - /opt/logging/provisioning/datasources
+        - /opt/logging/rules
+        - /opt/logging/alertmanager
+
+    - name: Create Loki config file
+      copy:
+        dest: /opt/logging/loki-config.yaml
+        content: |
+          auth_enabled: false
+          server:
+            http_listen_port: {{ loki_port | int }}
+          ingester:
+            lifecycler:
+              ring:
+                kvstore:
+                  store: inmemory
+                replication_factor: 1
+            chunk_idle_period: 5m
+            chunk_retain_period: 30s
+            wal:
+              enabled: true
+              dir: /loki/wal
+            max_transfer_retries: 0
+          schema_config:
+            configs:
+              - from: 2020-10-24
+                store: boltdb-shipper
+                object_store: filesystem
+                schema: v11
+                index:
+                  prefix: index_
+                  period: 24h
+          storage_config:
+            boltdb_shipper:
+              active_index_directory: /loki/index
+              cache_location: /loki/cache
+              shared_store: filesystem
+            filesystem:
+              directory: /loki/chunks
+          compactor:
+            working_directory: /loki/compactor
+            shared_store: filesystem
+          limits_config:
+            enforce_metric_name: false
+            reject_old_samples: true
+            reject_old_samples_max_age: 168h
+            max_streams_per_user: 5000
+          chunk_store_config:
+            max_look_back_period: 0s
+          table_manager:
+            retention_deletes_enabled: true
+            retention_period: 7d
+          ruler:
+            alertmanager_url: http://{{ alertmanager_container_name }}:{{ alertmanager_port }}
+            rule_path: /loki/rules
+            storage:
+              type: local
+              local:
+                directory: /loki/rules
+
+    - name: Add Loki datasource provisioning
+      copy:
+        dest: /opt/logging/provisioning/datasources/loki.yaml
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Loki
+              type: loki
+              access: proxy
+              url: http://{{ loki_container_name }}:{{ loki_port }}
+              isDefault: true
+
+    - name: Add Alertmanager config
+      copy:
+        dest: /opt/logging/alertmanager/config.yml
+        content: |
+          global:
+            resolve_timeout: 5m
+          route:
+            receiver: default
+            group_wait: 30s
+            group_interval: 5m
+            repeat_interval: 1h
+          receivers:
+            - name: default
+
+    - name: Create podman-compose.yml
+      copy:
+        dest: /opt/logging/podman-compose.yml
+        content: |
+          version: "3"
+          services:
+            loki:
+              image: "{{ loki_image }}"
+              container_name: "{{ loki_container_name }}"
+              user: "0:0"
+              ports:
+                - "{{ loki_port }}:{{ loki_port }}"
+              command: -config.file=/etc/loki/local-config.yaml -config.expand-env=true
+              volumes:
+                - /opt/logging/loki-config.yaml:/etc/loki/local-config.yaml
+                - /opt/logging/loki/chunks:/loki/chunks
+                - /opt/logging/loki/index:/loki/index
+                - /opt/logging/loki/cache:/loki/cache
+                - /opt/logging/loki/wal:/loki/wal
+                - /opt/logging/loki/compactor:/loki/compactor
+                - /opt/logging/rules:/loki/rules
+
+            grafana:
+              image: "{{ grafana_image }}"
+              container_name: "{{ grafana_container_name }}"
+              ports:
+                - "{{ grafana_port }}:{{ grafana_port }}"
+              environment:
+                GF_SECURITY_ADMIN_USER: "{{ grafana_user }}"
+                GF_SECURITY_ADMIN_PASSWORD: "{{ grafana_password }}"
+              depends_on:
+                - loki
+              volumes:
+                - grafana-data:/var/lib/grafana
+                - /opt/logging/provisioning:/etc/grafana/provisioning
+
+            alertmanager:
+              image: "{{ alertmanager_image }}"
+              container_name: "{{ alertmanager_container_name }}"
+              ports:
+                - "{{ alertmanager_port }}:9093"
+              volumes:
+                - /opt/logging/alertmanager/config.yml:/etc/alertmanager/config.yml
+
+          volumes:
+            grafana-data:
+
+    - name: Create systemd service for logging stack (Podman)
+      copy:
+        dest: /etc/systemd/system/logging-stack.service
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Grafana + Loki + Alertmanager Stack (Podman)
+          Requires=podman.service
+          After=podman.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=true
+          WorkingDirectory=/opt/logging
+          ExecStart=/usr/bin/podman-compose -f /opt/logging/podman-compose.yml up -d
+          ExecStop=/usr/bin/podman-compose -f /opt/logging/podman-compose.yml down
+          TimeoutStartSec=0
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: true
+
+    - name: Enable and start logging stack service
+      systemd:
+        name: logging-stack.service
+        state: started
+        enabled: true
+
+    - name: Wait for Grafana to be ready
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/health"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: grafana_health
+      retries: 30
+      delay: 10
+      until: grafana_health.status == 200
+      ignore_errors: true
+
+    - name: Deployment complete
+      debug:
+        msg: |
+          ✅ Grafana + Loki + Alertmanager stack is running!
+          - Grafana: {{ grafana_host }}:{{ grafana_port }} (user: {{ grafana_user }})
+          - Loki: {{ grafana_host }}:{{ loki_port }}
+          - Alertmanager: {{ grafana_host }}:{{ alertmanager_port }}
+          - Configs stored in /opt/logging
+
+    # ------------------------------------------------------------
+    # GRAFANA API KEY MANAGEMENT
+    # ------------------------------------------------------------
+    - name: Reset Grafana Admin Token and Get New One
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/auth/keys"
+        method: GET
+        user: "{{ grafana_user }}"
+        password: "{{ grafana_password }}"
+        force_basic_auth: true
+      register: grafana_tokens
+
+    - name: Delete old Grafana API keys
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/auth/keys/{{ item.id }}"
+        method: DELETE
+        user: "{{ grafana_user }}"
+        password: "{{ grafana_password }}"
+        force_basic_auth: true
+      loop: "{{ grafana_tokens.json }}"
+      when: grafana_tokens.json | length > 0
+      ignore_errors: true
+
+    - name: Create new Grafana API key
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/auth/keys"
+        method: POST
+        user: "{{ grafana_user }}"
+        password: "{{ grafana_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          name: "ansible_automation_key"
+          role: "Admin"
+          secondsToLive: 0
+      register: grafana_api_key
+
+    - set_fact:
+        grafana_token: "{{ grafana_api_key.json.key }}"
+
+    - name: Get Loki datasource UID from Grafana
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/datasources"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      register: grafana_datasources
+      failed_when: grafana_datasources.status >= 300
+
+    - name: Set Loki datasource UID fact
+      set_fact:
+        loki_datasource_uid: "{{ (grafana_datasources.json | selectattr('type', 'equalto', 'loki') | list | first).uid }}"
+
+    # =========================================================
+    # STEP 1️⃣ - Fetch existing alert rules
+    # =========================================================
+    - name: Get all existing Grafana alert rules
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/alert-rules"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      register: grafana_alert_rules
+      failed_when: grafana_alert_rules.status >= 300
+
+    # =========================================================
+    # STEP 2️⃣ - Delete each existing alert rule by UID
+    # =========================================================
+    - name: Delete all existing Grafana alert rules
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/alert-rules/{{ item.uid }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      loop: "{{ grafana_alert_rules.json }}"
+      when: grafana_alert_rules.json | length > 0
+      failed_when: grafana_alert_rules.status >= 300
+
+    - name: Wait a few seconds for Grafana to flush deleted alert rules
+      pause:
+        seconds: 5
+
+    - name: Get all existing folders
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/folders"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      register: grafana_folders
+      failed_when: grafana_folders.status >= 300
+
+    - name: Delete all existing folders
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/folders/{{ item.uid }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      loop: "{{ grafana_folders.json }}"
+      failed_when: grafana_folders.status >= 300
+      when: grafana_folders.json | length > 0
+
+    - name: Create new folder for alerts
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/folders"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          title: "T-Pot Cyber Defense"
+      register: grafana_folder
+      failed_when: grafana_folder.status >= 300
+
+    # =========================================================
+    # STEP 3️⃣ - Create new alert rules from alerts_list
+    # =========================================================
+    - name: Set folder UID fact
+      set_fact:
+        folderUID: "{{ grafana_folder.json.uid }}"
+
+    - name: Define alerts list
+      set_fact:
+        alerts_list:
+          - title: "Cowrie SSH Brute Force - Rapid"
+            folderUID: "{{ folderUID }}"
+            orgID: 1
+            ruleGroup: "T-Pot Honeypots"
+            condition: "B"
+            for: "0s"
+            interval: "15s"
+            noDataState: "OK"
+            execErrState: "OK"
+            data:
+              - refId: "A"
+                relativeTimeRange:
+                  from: 60
+                  to: 0
+                datasourceUid: "{{ loki_datasource_uid}}"
+                model:
+                  expr: 'sum by(src_ip) (count_over_time({job="honeypot-logs"} |= "cowrie.login.failed"[1m])) > 5'
+                  intervalMs: 5000
+                  maxDataPoints: 100
+                  refId: "A"
+              - refId: "B"
+                relativeTimeRange:
+                  from: 0
+                  to: 0
+                datasourceUid: "__expr__"
+                model:
+                  conditions:
+                    - evaluator:
+                        params: [5]
+                        type: "gt"
+                      operator:
+                        type: "and"
+                      query:
+                        params: ["A"]
+                      reducer:
+                        type: "last"
+                      type: "query"
+                  type: "classic_conditions"
+                  intervalMs: 15000
+                  maxDataPoints: 43200
+            labels:
+              severity: "critical"
+              honeypot: "cowrie"
+              response: "rapid"
+            annotations:
+              summary: "Rapid SSH brute force from {{ '{{' ~ '\\$labels.src_ip' ~ '}}' }}"
+              description: |
+                More than 5 SSH attempts from {{ '{{' ~ '\\$labels.src_ip' ~ '}}' }} in the last minute on T-Pot (Cowrie) — rapid detection.
+
+          - title: "Dionaea FTP Brute Force"
+            folderUID: "{{ folderUID }}"
+            orgID: 1
+            ruleGroup: "T-Pot Honeypots"
+            condition: "B"
+            for: "0s"
+            interval: "15s"
+            noDataState: "OK"
+            execErrState: "OK"
+            data:
+              - refId: "A"
+                relativeTimeRange:
+                  from: 300
+                  to: 0
+                datasourceUid: "{{ loki_datasource_uid }}"
+                model:
+                  expr: 'sum by(src_ip) (count_over_time({job="honeypot-logs"} |= "ftpd" |= "root" [5m])) > 5'
+                  intervalMs: 5000
+                  maxDataPoints: 100
+                  refId: "A"
+              - refId: "B"
+                relativeTimeRange:
+                  from: 0
+                  to: 0
+                datasourceUid: "__expr__"
+                model:
+                  conditions:
+                    - evaluator:
+                        params: [5]
+                        type: "gt"
+                      operator:
+                        type: "and"
+                      query:
+                        params: ["A"]
+                      reducer:
+                        type: "last"
+                      type: "query"
+                  type: "classic_conditions"
+                  intervalMs: 15000
+                  maxDataPoints: 43200
+            labels:
+              severity: "warning"
+              honeypot: "dionaea"
+              response: "rapid"
+            annotations:
+              summary: "Rapid FTP brute force from {{'{{ $labels.src_ip }}'}}"
+              description: "More than 5 failed FTP login attempts from {{'{{ $labels.src_ip }}'}} in the last 5 minutes on T-Pot Dionaea honeypot."
+
+          - title: "Suricata HTTP Anomaly - Rapid"
+            folderUID: "{{ folderUID }}"
+            orgID: 1
+            ruleGroup: "T-Pot Honeypots"
+            condition: "B"
+            for: "0s"
+            interval: "15s"
+            noDataState: "OK"
+            execErrState: "OK"
+            data:
+              - refId: "A"
+                relativeTimeRange:
+                  from: 30
+                  to: 0
+                datasourceUid: "{{ loki_datasource_uid }}"
+                model:
+                  expr: 'sum by(src_ip) (count_over_time({job="honeypot-logs"} |= "http" |= "libhtp::request_uri_not_seen" [30s])) > 10'
+                  intervalMs: 5000
+                  maxDataPoints: 100
+                  refId: "A"
+              - refId: "B"
+                relativeTimeRange:
+                  from: 0
+                  to: 0
+                datasourceUid: "__expr__"
+                model:
+                  conditions:
+                    - evaluator:
+                        params: [10]
+                        type: "gt"
+                      operator:
+                        type: "and"
+                      query:
+                        params: ["A"]
+                      reducer:
+                        type: "last"
+                      type: "query"
+                  type: "classic_conditions"
+                  intervalMs: 15000
+                  maxDataPoints: 43200
+            labels:
+              severity: "critical"
+              honeypot: "suricata"
+              response: "rapid"
+            annotations:
+              summary: "Rapid HTTP anomaly from {{'{{ $labels.src_ip }}'}}"
+              description: "More than 10 anomalous HTTP requests from {{'{{ $labels.src_ip }}'}} in the last 30s on T-Pot (Suricata) honeypot."
+
+          - title: "Nginx High Request Rate - Rapid"
+            folderUID: "{{ folderUID }}"
+            orgID: 1
+            ruleGroup: "T-Pot Honeypots"
+            condition: "B"
+            for: "0s"
+            interval: "15s"
+            noDataState: "OK"
+            execErrState: "OK"
+            data:
+              - refId: "A"
+                relativeTimeRange:
+                  from: 30
+                  to: 0
+                datasourceUid: "{{ loki_datasource_uid }}"
+                model:
+                  expr: 'sum by(src_ip) (count_over_time({job="honeypot-logs"} |= "request_uri" [30s])) > 10'
+                  intervalMs: 5000
+                  maxDataPoints: 100
+                  refId: "A"
+              - refId: "B"
+                relativeTimeRange:
+                  from: 0
+                  to: 0
+                datasourceUid: "__expr__"
+                model:
+                  conditions:
+                    - evaluator:
+                        params: [10]
+                        type: "gt"
+                      operator:
+                        type: "and"
+                      query:
+                        params: ["A"]
+                      reducer:
+                        type: "last"
+                      type: "query"
+                  type: "classic_conditions"
+                  intervalMs: 15000
+                  maxDataPoints: 43200
+            labels:
+              severity: "critical"
+              honeypot: "nginx"
+              response: "rapid"
+            annotations:
+              summary: "Rapid Nginx request rate from {{'{{ $labels.src_ip }}'}}"
+              description: "More than 10 HTTP requests from {{'{{ $labels.src_ip }}'}} in the last 30s to Nginx endpoints (Kibana/websocket) on T-Pot."
+
+          - title: "h0neytr4p HTTP Flood / Probing - Rapid"
+            folderUID: "{{ folderUID }}"
+            orgID: 1
+            ruleGroup: "T-Pot Honeypots"
+            condition: "B"
+            for: "0s"
+            interval: "15s"
+            noDataState: "OK"
+            execErrState: "OK"
+            data:
+              - refId: "A"
+                relativeTimeRange:
+                  from: 30
+                  to: 0
+                datasourceUid: "{{ loki_datasource_uid }}"
+                model:
+                  # count POSTs per src_ip over last 30s; alert if > 8
+                  expr: 'sum by(src_ip) (count_over_time({job="honeypot-logs"} | json | request_method="POST" [30s])) > 8'
+                  intervalMs: 5000
+                  maxDataPoints: 100
+                  refId: "A"
+              - refId: "B"
+                relativeTimeRange:
+                  from: 0
+                  to: 0
+                datasourceUid: "__expr__"
+                model:
+                  conditions:
+                    - evaluator:
+                        params: [8]
+                        type: "gt"
+                      operator:
+                        type: "and"
+                      query:
+                        params: ["A"]
+                      reducer:
+                        type: "last"
+                      type: "query"
+                  type: "classic_conditions"
+                  intervalMs: 15000
+                  maxDataPoints: 43200
+            labels:
+              severity: "critical"
+              honeypot: "h0neytr4p"
+              response: "rapid"
+            annotations:
+              summary: "High POST activity from {{'{{ $labels.src_ip }}'}} to h0neytr4p"
+              description: "Detected >8 POST requests from {{'{{ $labels.src_ip }}'}} in 30s (random POST paths / probing). Tune threshold/interval if noisy."
+
+    - name: Create alert rules from alerts_list
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/alert-rules"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body: "{{ item }}"
+      loop: "{{ alerts_list }}"
+      register: alert_creation_result
+      failed_when: alert_creation_result.status >= 300
+
+    - name: Debug alert creation results
+      debug:
+        var: alert_creation_result.results
+
+    - name: Verify alert rules were created
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/alert-rules"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      register: final_alert_rules
+
+    - name: Display created alert rules
+      debug:
+        msg: "Successfully created {{ final_alert_rules.json | length }} alert rules"
+
+    # =========================================================
+    # N8N INTEGRATION - CLEAN UP EXISTING THEN CREATE NEW
+    # =========================================================
+    - name: Get existing notification policy
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/policies"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      register: existing_policy
+      failed_when: existing_policy.status >= 300
+
+    - name: Delete existing notification policy
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/policies"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      when: existing_policy.json is defined
+      failed_when: existing_policy.status >= 300
+
+    - name: Get all existing contact points
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/contact-points"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      register: existing_contact_points
+      failed_when: existing_contact_points.status >= 300
+
+    - name: Delete all existing contact points
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/contact-points/{{ item.uid }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      loop: "{{ existing_contact_points.json }}"
+      when: existing_contact_points.json | length > 0
+      failed_when: existing_contact_points.status >= 300
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Create n8n webhook contact point
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/contact-points"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          name: "n8n-security-automation"
+          type: "webhook"
+          disableResolveMessage: true
+          settings:
+            url: "http://{{ n8n_host }}:{{ n8n_port }}/webhook/grafana-alert"
+            httpMethod: "POST"
+            username: "{{ n8n_user }}"
+            password: "{{ n8n_pass }}"
+      register: contact_point_result
+      failed_when: contact_point_result.status >= 300
+
+    - name: Update notification policy to use n8n webhook
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/policies"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          receiver: "n8n-security-automation"
+          group_by: ["alertname"]
+          group_wait: "30s"
+          group_interval: "5m"
+          repeat_interval: "1h"
+      register: policy_result
+      failed_when: policy_result.status >= 300
+
+    - name: Verify contact point was created
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/contact-points"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      register: contact_points
+      failed_when: contact_points.status >= 300
+
+    - name: Display contact points
+      debug:
+        msg: "Available contact points: {{ contact_points.json | map(attribute='name') | list }}"
+
+    - name: Verify notification policy
+      uri:
+        url: "{{ grafana_host }}:{{ grafana_port }}/api/v1/provisioning/policies"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ grafana_token }}"
+      register: notification_policy
+      failed_when: notification_policy.status >= 300
+
+    - name: Display notification policy
+      debug:
+        msg: "Notification policy receiver: {{ notification_policy.json.receiver }}"
+
+    - name: Final n8n integration status
+      debug:
+        msg: |
+          ✅ n8n Integration Complete!
+          - Grafana will send alerts to: {{ n8n_host }}:{{ n8n_port }}/webhook/grafana-alert
+          - Contact point: n8n-security-automation
+          - Make sure n8n is running and the workflow is active!

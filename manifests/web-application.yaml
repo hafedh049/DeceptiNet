@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: "{{ K8S_FRONTEND_DEPLOYMENT }}"
+  namespace: "{{ K8S_NAMESPACE }}"
+  labels:
+    app: "{{ K8S_FRONTEND_DEPLOYMENT }}"
+spec:
+  replicas: 10
+  selector:
+    matchLabels:
+      app: "{{ K8S_FRONTEND_DEPLOYMENT }}"
+  template:
+    metadata:
+      labels:
+        app: "{{ K8S_FRONTEND_DEPLOYMENT }}"
+    spec:
+      containers:
+        - name: "{{ K8S_FRONTEND_DEPLOYMENT }}"
+          image: "{{ K8S_FRONTEND_IMAGE }}"
+          ports:
+            - containerPort: { { K8S_LOCAL_PORT } }
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: "{{ K8S_FRONTEND_DEPLOYMENT }}"
+  namespace: "{{ K8S_NAMESPACE }}"
+spec:
+  selector:
+    app: "{{ K8S_FRONTEND_DEPLOYMENT }}"
+  ports:
+    - protocol: TCP
+      port: { { K8S_LOCAL_PORT } }
+      targetPort: { { K8S_LOCAL_PORT } }
+      nodePort: { { K8S_FRONTEND_NODE_PORT } }
+  type: NodePort

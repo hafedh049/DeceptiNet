@@ -1,26 +1,44 @@
 [
     {
         "name": "Ansible",
-        "path": "D:/Virtual Machines/Ansible\\Ansible.vmx",
-        "ip": "192.168.74.142",
+        "path": "D:/Virtual Machines/Ansible/Ansible.vmx",
+        "ip": "192.168.3.135",
         "state": "start"
     },
     {
-        "name": "T-POT",
-        "path": "D:/Virtual Machines/T-POT\\T-POT.vmx",
-        "ip": "192.168.74.253",
+        "name": "Red",
+        "path": "D:/Virtual Machines/Red/Red.vmx",
+        "ip": "192.168.3.136",
         "state": "start"
     },
     {
-        "name": "Red-Blue",
-        "path": "D:/Virtual Machines/Red-Blue\\Red-Blue.vmx",
-        "ip": "192.168.74.147",
+        "name": "Blue",
+        "path": "D:/Virtual Machines/Blue/Blue.vmx",
+        "ip": "192.168.3.137",
         "state": "start"
     },
     {
         "name": "HashiCorp",
-        "path": "D:/Virtual Machines/HashiCorp\\HashiCorp.vmx",
-        "ip": "192.168.74.111",
+        "path": "D:/Virtual Machines/HashiCorp/HashiCorp.vmx",
+        "ip": "192.168.3.138",
+        "state": "start"
+    },
+    {
+        "name": "PAM-WK-1",
+        "path": "D:/Virtual Machines/PAM-WK-1/PAM-WK-1.vmx",
+        "ip": "192.168.3.139",
+        "state": "start"
+    },
+    {
+        "name": "PAM-WN-2",
+        "path": "D:/Virtual Machines/PAM-WN-2/PAM-WN-2.vmx",
+        "ip": "192.168.3.140",
+        "state": "start"
+    },
+    {
+        "name": "T-Pot",
+        "ip": "192.168.3.141",
+        "path": "D:/Virtual Machines/T-Pot/T-Pot.vmx",
         "state": "start"
     }
 ]

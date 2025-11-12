@@ -1,0 +1,104 @@
+- name: Deploy Promtail Log Shipper on T-Pot (sends logs to Loki on Arsenal)
+  hosts: T-Pot
+  vars:
+    promtail_image: "{{ PROMTAIL_IMAGE }}"
+    promtail_container_name: "{{ PROMTAIL_CONTAINER_NAME }}"
+    promtail_port: "{{ PROMTAIL_PORT }}"
+    loki_port: "{{ LOKI_PORT }}"
+    promtail_dir: /home/core/promtail
+
+  tasks:
+    - name: "[PROMTAIL] Ensure Promtail directory exists"
+      file:
+        path: "{{ promtail_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "[PROMTAIL] Pull Promtail image"
+      command: podman pull "{{ promtail_image }}"
+
+    - name: "[PROMTAIL] Create Promtail config file"
+      copy:
+        dest: "{{ promtail_dir }}/config.yml"
+        content: |
+          server:
+            http_listen_port: {{ promtail_port | int }}
+            grpc_listen_port: 0
+
+          positions:
+            filename: /tmp/positions.yaml
+
+          clients:
+            - url: "http://{{ hostvars['Arsenal']['ansible_host'] }}:{{ loki_port }}/loki/api/v1/push"
+
+          scrape_configs:
+            - job_name: varlogs
+              static_configs:
+                - targets: ["localhost"]
+                  labels:
+                    job: honeypot-logs
+                    __path__: /home/core/tpotce/data/cowrie/log/cowrie.json
+                - targets: ["localhost"]
+                  labels:
+                    job: honeypot-logs
+                    __path__: /home/core/tpotce/data/nginx/log/access.log
+                - targets: ["localhost"]
+                  labels:
+                    job: honeypot-logs
+                    __path__: /home/core/tpotce/data/dionaea/log/dionaea.json
+                - targets: ["localhost"]
+                  labels:
+                    job: honeypot-logs
+                    __path__: /home/core/tpotce/data/suricata/log/eve.json
+                - targets: ["localhost"]
+                  labels:
+                    job: honeypot-logs
+                    __path__: /home/core/tpotce/data/h0neytr4p/log/log.json
+
+              pipeline_stages:
+                - json:
+                    expressions:
+                      src_ip: src_ip
+                      timestamp: timestamp
+                - labels:
+                    src_ip:
+
+    - name: "[PROMTAIL] Kill promtail process if running"
+      shell: |
+        pid=$(podman inspect --format '{{'{{' }}.State.Pid{{ '}}' }}' {{ promtail_container_name }} 2>/dev/null || echo "")
+        if [ -n "$pid" ]; then
+          kill -9 $pid || true
+        fi
+
+    - name: "[PROMTAIL] Stop existing Promtail container if running"
+      command: podman rm -f "{{ promtail_container_name }}"
+
+    - name: "[PROMTAIL] Start Promtail with Podman run command"
+      command: >
+        podman run -d
+        --name {{ promtail_container_name }}
+        --restart unless-stopped
+        --network host
+        -v /home/core/tpotce/data:/home/core/tpotce/data:ro
+        -v {{ promtail_dir }}/config.yml:/etc/promtail/config.yml:ro
+        {{ promtail_image }}
+        -config.file=/etc/promtail/config.yml
+      args:
+        creates: "/var/lib/containers/storage/overlay-containers/{{ promtail_container_name }}"
+
+    - name: "[PROMTAIL] Wait for Promtail to start"
+      wait_for:
+        port: "{{ promtail_port }}"
+        host: localhost
+        timeout: 30
+        delay: 5
+
+    - name: "[PROMTAIL] Deployment complete"
+      debug:
+        msg: |
+          ✅ Promtail is running on {{ inventory_hostname }}.
+          - Container: {{ promtail_container_name }}
+          - Image: {{ promtail_image }}
+          - Shipping logs to Loki at: {{ hostvars['Arsenal']['ansible_host'] }}:{{ loki_port }}
+          - Config: /opt/promtail/config.yml
+          - Logs scraped

@@ -1,0 +1,82 @@
+---
+- name: Uninstall k3s Kubernetes Cluster
+  hosts: PAM-WK-1, PAM-WK-2
+  become: true
+  vars:
+    k3s_user: "root"
+
+  tasks:
+    # ============================================================
+    # Stop and disable service
+    # ============================================================
+    - name: "[K3S] Stop and disable k3s service if running"
+      systemd:
+        name: k3s
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    # ============================================================
+    # Run k3s uninstall script (clean removal)
+    # ============================================================
+    - name: "[K3S] Run official uninstall script if available"
+      shell: |
+        if [ -f /usr/local/bin/k3s-uninstall.sh ]; then
+          /usr/local/bin/k3s-uninstall.sh
+        fi
+      args:
+        executable: /bin/bash
+      ignore_errors: true
+
+    # ============================================================
+    # Remove leftover files and dirs
+    # ============================================================
+    - name: "[K3S] Remove residual files and directories"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /usr/local/bin/k3s
+        - /usr/local/bin/k3s-uninstall.sh
+        - /etc/systemd/system/k3s.service
+        - /etc/rancher/k3s
+        - /var/lib/rancher
+        - /var/lib/kubelet
+        - /var/lib/cni
+        - /run/k3s
+      ignore_errors: true
+
+    # ============================================================
+    # Remove user kubeconfig
+    # ============================================================
+    - name: "[K3S] Remove kubeconfig for non-root user"
+      file:
+        path: "/home/{{ k3s_user }}/.kube"
+        state: absent
+      when: k3s_user != "root"
+      ignore_errors: true
+
+    - name: "[K3S] Remove kubeconfig for root"
+      file:
+        path: "/root/.kube"
+        state: absent
+      when: k3s_user == "root"
+      ignore_errors: true
+
+    # ============================================================
+    # Clean bash alias
+    # ============================================================
+    - name: "[K3S] Remove alias for kubectl (k)"
+      lineinfile:
+        path: "{{ (k3s_user == 'root') | ternary('/root/.bashrc', '/home/' + k3s_user + '/.bashrc') }}"
+        regexp: "^alias k='kubectl'"
+        state: absent
+      ignore_errors: true
+
+    - name: "[K3S] Confirm deletion complete"
+      debug:
+        msg: |
+          🧹 k3s and all its components have been successfully removed.
+          - Service: stopped and disabled
+          - Binaries and configs: purged
+          - User kubeconfig and aliases: cleaned up

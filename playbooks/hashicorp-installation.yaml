@@ -1,0 +1,115 @@
+---
+- name: Setup Vault + Boundary Dev on RHEL 10 minimal using Podman
+  hosts: HashiCorp
+  become: true
+  vars:
+    vault_container_name: vault-dev
+    boundary_container_name: boundary-dev
+    db_container_name: boundary-db
+    vault_port: 8200
+    boundary_port: 9200
+    db_port: 5432
+    vault_data_dir: /opt/vault/data
+    boundary_data_dir: /opt/boundary/data
+    podman_bin: /usr/bin/podman
+    vault_token: root
+    boundary_db_user: boundary
+    boundary_db_pass: boundarypass
+    boundary_db_name: boundary
+
+  tasks:
+    - name: Ensure required packages
+      dnf:
+        name:
+          - podman
+          - jq
+          - curl
+          - unzip
+        state: present
+
+    - name: Ensure data directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ vault_data_dir }}"
+        - "{{ boundary_data_dir }}"
+
+    - name: Pull required container images
+      command: "{{ podman_bin }} pull {{ item }}"
+      loop:
+        - hashicorp/vault:latest
+        - hashicorp/boundary:latest
+        - postgres:16
+
+    - name: Start PostgreSQL for Boundary
+      command: >
+        {{ podman_bin }} run -d --name {{ db_container_name }}
+        -e POSTGRES_USER={{ boundary_db_user }}
+        -e POSTGRES_PASSWORD={{ boundary_db_pass }}
+        -e POSTGRES_DB={{ boundary_db_name }}
+        -p {{ db_port }}:5432
+        -v /opt/boundary/db:/var/lib/postgresql/data
+        --network host
+        postgres:16
+
+    - name: Wait for PostgreSQL to be ready
+      wait_for:
+        port: "{{ db_port }}"
+        delay: 5
+        timeout: 60
+
+    - name: Start Vault container
+      command: >
+        {{ podman_bin }} run -d --name {{ vault_container_name }}
+        -p {{ vault_port }}:8200
+        -v {{ vault_data_dir }}:/vault/file
+        -e 'VAULT_DEV_ROOT_TOKEN_ID={{ vault_token }}'
+        --network host
+        hashicorp/vault:latest server
+
+    - name: Wait for Vault API
+      wait_for:
+        port: "{{ vault_port }}"
+        delay: 5
+        timeout: 60
+
+    - name: Enable Vault transit engine
+      command: >
+        {{ podman_bin }} exec {{ vault_container_name }}
+        vault secrets enable transit
+      environment:
+        VAULT_ADDR: "http://127.0.0.1:{{ vault_port }}"
+        VAULT_TOKEN: "{{ vault_token }}"
+      ignore_errors: true
+
+    - name: Create Boundary transit key
+      command: >
+        {{ podman_bin }} exec {{ vault_container_name }}
+        vault write -f transit/keys/boundary_root
+      environment:
+        VAULT_ADDR: "http://127.0.0.1:{{ vault_port }}"
+        VAULT_TOKEN: "{{ vault_token }}"
+      ignore_errors: true
+
+    - name: Start Boundary container
+      command: >
+        {{ podman_bin }} run -d --name {{ boundary_container_name }}
+        -p {{ boundary_port }}:9200
+        -v {{ boundary_data_dir }}:/boundary/data
+        -e 'BOUNDARY_DATABASE_URL=postgresql://{{ boundary_db_user }}:{{ boundary_db_pass }}@127.0.0.1:{{ db_port }}/{{ boundary_db_name }}'
+        -e 'BOUNDARY_VAULT_ADDR=http://127.0.0.1:{{ vault_port }}'
+        -e 'BOUNDARY_VAULT_TOKEN={{ vault_token }}'
+        -e 'BOUNDARY_VAULT_TRANSIT_KEY=boundary_root'
+        -e 'BOUNDARY_DEV_LICENSE=accept'
+        --network host
+        hashicorp/boundary:latest server -config=/boundary/data
+
+    - name: Show info
+      debug:
+        msg: |
+          ✅ Vault running on http://127.0.0.1:{{ vault_port }} (root token: {{ vault_token }})
+          ✅ Boundary running on http://127.0.0.1:{{ boundary_port }}
+          ✅ PostgreSQL for Boundary on port {{ db_port }}
+          ✅ Vault Transit key "boundary_root" created

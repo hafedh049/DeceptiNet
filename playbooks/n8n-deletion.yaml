@@ -1,0 +1,61 @@
+---
+- name: COMPLETE WIPEOUT - Remove n8n Automation Platform and All Data (Podman)
+  hosts: Blue
+  vars:
+    n8n_dir: "{{ N8N_DIR }}"
+    n8n_container_name: "{{ N8N_CONTAINER_NAME }}"
+
+  tasks:
+    - name: "[WIPEOUT] Ensure required variables are defined"
+      assert:
+        that:
+          - n8n_dir is defined
+          - n8n_container_name is defined
+        fail_msg: "N8N_DIR and N8N_CONTAINER_NAME must be defined."
+
+    # ------------------------------------------------------------
+    # STOP & REMOVE CONTAINER
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Stop n8n container (if running)"
+      command: podman stop {{ n8n_container_name }}
+      ignore_errors: true
+
+    - name: "[WIPEOUT] Remove n8n container"
+      command: podman rm {{ n8n_container_name }}
+      ignore_errors: true
+
+    # ------------------------------------------------------------
+    # TEAR DOWN PODMAN-COMPOSE STACK
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Run podman-compose down with volume removal (if compose file exists)"
+      command: podman-compose -f "{{ n8n_dir }}/podman-compose.yml" down -v --remove-orphans
+      args:
+        chdir: "{{ n8n_dir }}"
+      ignore_errors: true
+
+    # ------------------------------------------------------------
+    # REMOVE PODMAN VOLUME (fallback in case compose down missed it)
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Remove n8n_data Podman volume (if exists)"
+      command: podman volume rm n8n_data
+      ignore_errors: true
+
+    # ------------------------------------------------------------
+    # DELETE ALL n8n FILES & WORKFLOWS
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Remove entire n8n directory (configs, workflows, data)"
+      file:
+        path: "{{ n8n_dir }}"
+        state: absent
+
+    # ------------------------------------------------------------
+    # FINAL CONFIRMATION
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Confirm successful cleanup"
+      debug:
+        msg: |
+          🔥 n8n has been completely removed from {{ inventory_hostname }}.
+          - Container '{{ n8n_container_name }}' deleted.
+          - Podman volume 'n8n_data' removed.
+          - Entire directory '{{ n8n_dir }}' erased (including all workflows and settings).
+          - No sensitive data or automation artifacts remain.

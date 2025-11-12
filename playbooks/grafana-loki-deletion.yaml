@@ -1,0 +1,84 @@
+---
+- name: COMPLETE WIPEOUT - Remove Grafana + Loki Logging Stack (Podman)
+  hosts: Blue
+  vars:
+    grafana_container_name: "{{ GRAFANA_CONTAINER_NAME }}"
+    loki_container_name: "{{ LOKI_CONTAINER_NAME }}"
+
+  tasks:
+    - name: Ensure required variables are defined
+      assert:
+        that:
+          - grafana_container_name is defined
+          - loki_container_name is defined
+        fail_msg: "GRAFANA_CONTAINER_NAME and LOKI_CONTAINER_NAME must be defined."
+
+    # ------------------------------------------------------------
+    # STOP SYSTEMD SERVICE (if active)
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Stop logging-stack systemd service (if exists)"
+      systemd:
+        name: logging-stack.service
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    # ------------------------------------------------------------
+    # STOP & REMOVE PODMAN CONTAINERS
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Stop Grafana container"
+      command: podman stop {{ grafana_container_name }}
+      ignore_errors: true
+
+    - name: "[WIPEOUT] Remove Grafana container"
+      command: podman rm {{ grafana_container_name }}
+      ignore_errors: true
+
+    - name: "[WIPEOUT] Stop Loki container"
+      command: podman stop {{ loki_container_name }}
+      ignore_errors: true
+
+    - name: "[WIPEOUT] Remove Loki container"
+      command: podman rm {{ loki_container_name }}
+      ignore_errors: true
+
+    # ------------------------------------------------------------
+    # REMOVE PODMAN-COMPOSE RESOURCES & VOLUMES
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Run podman-compose down in /opt/logging (if compose file exists)"
+      command: podman-compose -f /opt/logging/docker-compose.yml down --volumes --remove-orphans
+      args:
+        chdir: /opt/logging
+      ignore_errors: true
+
+    # ------------------------------------------------------------
+    # DELETE ALL LOGGING DATA & CONFIGS
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Remove entire /opt/logging directory (configs, data, secrets)"
+      file:
+        path: /opt/logging
+        state: absent
+
+    # ------------------------------------------------------------
+    # REMOVE SYSTEMD SERVICE UNIT FILE
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Remove logging-stack systemd unit file"
+      file:
+        path: /etc/systemd/system/logging-stack.service
+        state: absent
+
+    - name: "[WIPEOUT] Reload systemd daemon"
+      systemd:
+        daemon_reload: yes
+
+    # ------------------------------------------------------------
+    # FINAL CONFIRMATION
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Confirm successful cleanup"
+      debug:
+        msg: |
+          🔥 GRAFANA + LOKI STACK FULLY REMOVED from {{ inventory_hostname }}.
+          - Containers '{{ grafana_container_name }}' and '{{ loki_container_name }}' deleted.
+          - Systemd service 'logging-stack.service' removed.
+          - All data in /opt/logging permanently erased.
+          - No logs, dashboards, or credentials remain.

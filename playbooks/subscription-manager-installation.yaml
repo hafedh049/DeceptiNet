@@ -1,0 +1,13 @@
+---
+- name: Register all RHEL systems
+  hosts: all:!T-Pot
+  become: true
+  tasks:
+    - name: Register system with Red Hat
+      ansible.builtin.command: >
+        subscription-manager register
+        --force
+        --username={{ REDHAT_USERNAME }}
+        --password={{ REDHAT_PASSWORD }}
+      register: register_result
+      changed_when: "'The system has been registered' in register_result.stdout"

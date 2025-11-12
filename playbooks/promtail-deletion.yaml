@@ -1,0 +1,60 @@
+---
+- name: COMPLETE WIPEOUT - Remove Promtail from T-Pot
+  hosts: T-Pot
+  vars:
+    promtail_container_name: "{{ PROMTAIL_CONTAINER_NAME }}"
+
+  tasks:
+    - name: "[WIPEOUT] Ensure PROMTAIL_CONTAINER_NAME is defined"
+      assert:
+        that: promtail_container_name is defined
+        fail_msg: "PROMTAIL_CONTAINER_NAME must be defined."
+
+    # ------------------------------------------------------------
+    # STOP & REMOVE CONTAINER
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Stop Promtail container (if running)"
+      command: podman stop {{ promtail_container_name }}
+      ignore_errors: true
+
+    - name: "[WIPEOUT] Remove Promtail container"
+      command: podman rm {{ promtail_container_name }}
+      ignore_errors: true
+
+    # ------------------------------------------------------------
+    # TEAR DOWN PODMAN COMPOSE STACK
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Run podman-compose down in /opt/promtail (if exists)"
+      command: podman-compose -f /opt/promtail/docker-compose.yml down --remove-orphans
+      args:
+        chdir: /opt/promtail
+      ignore_errors: true
+
+    # ------------------------------------------------------------
+    # REMOVE PROMTAIL CONFIGURATION & FILES
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Remove Promtail directory and all contents"
+      file:
+        path: /opt/promtail
+        state: absent
+
+    # ------------------------------------------------------------
+    # OPTIONAL: REMOVE PROMTAIL PODMAN IMAGE (commented by default)
+    # ------------------------------------------------------------
+    # - name: "[WIPEOUT] Remove Promtail Podman image"
+    #   containers.podman.podman_image:
+    #     name: "{{ PROMTAIL_IMAGE }}"
+    #     state: absent
+    #   ignore_errors: true
+
+    # ------------------------------------------------------------
+    # FINAL CONFIRMATION
+    # ------------------------------------------------------------
+    - name: "[WIPEOUT] Confirm Promtail removal"
+      debug:
+        msg: |
+          🔥 Promtail has been completely removed from {{ inventory_hostname }}.
+          - Container '{{ promtail_container_name }}' deleted.
+          - Podman Compose stack torn down.
+          - Configs and data in /opt/promtail erased.
+          - Log shipping to Loki is now disabled.

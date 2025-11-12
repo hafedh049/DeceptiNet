@@ -1,92 +1,300 @@
 ---
-- name: Install MITRE CALDERA
-  hosts: Red-Blue
+# Full Caldera Server + Agent Deployment with PAW Persistence (Podman RHEL 10)
+- name: Deploy Caldera Server + Agents with PAW Persistence
+  hosts: Red, T-Pot
   become: true
+  gather_facts: true
   vars:
-    caldera_dir: /opt/caldera
-    caldera_venv: /opt/caldera/venv
+    caldera_dir: "{{ CALDERA_DIR }}"
+    caldera_port: "{{ CALDERA_PORT }}"
+    caldera_red_user: "{{ CALDERA_RED_USER }}"
+    caldera_blue_user: "{{ CALDERA_BLUE_USER }}"
+    caldera_blue_api_key: "{{ CALDERA_BLUE_API_KEY }}"
+    caldera_red_api_key: "{{ CALDERA_RED_API_KEY }}"
+    caldera_password: "{{ CALDERA_PASSWORD }}"
+    caldera_host: "{{ CALDERA_HOST }}"
+    caldera_container_name: "{{ CALDERA_CONTAINER_NAME }}"
+    caldera_image: "{{ CALDERA_IMAGE }}"
 
   tasks:
-    - name: Install dependencies
-      apt:
+    # ---------------- Podman Deployment ----------------
+    - name: Install dnf dependencies
+      dnf:
         name:
-          - git
-          - python3
-          - python3-venv
           - python3-pip
-          - build-essential
-          - golang
-          - npm
-        update_cache: yes
+          - podman
+          - podman-compose
+          - jq
+          - curl
+        state: present
+      when: inventory_hostname == "Caldera"
 
-    - name: Check if CALDERA repo already exists
-      stat:
-        path: "{{ caldera_dir }}/.git"
-      register: caldera_repo
+    - name: Ensure podman is ready (no daemon required)
+      shell: podman info
+      register: podman_info
+      changed_when: false
+      failed_when: podman_info.rc != 0
+      when: inventory_hostname == "Caldera"
 
-    - name: Clone CALDERA repository
-      git:
-        repo: "https://github.com/mitre/caldera.git"
-        dest: "{{ caldera_dir }}"
-        version: master
-        recursive: yes
-        force: yes
-      when: not caldera_repo.stat.exists
+    - name: Ensure caldera directory exists
+      file:
+        path: "{{ caldera_dir }}"
+        state: directory
+        mode: "0755"
+      when: inventory_hostname == "Caldera"
 
-    - name: Ensure CALDERA repository is up to date
-      git:
-        repo: "https://github.com/mitre/caldera.git"
-        dest: "{{ caldera_dir }}"
-        version: master
-        recursive: yes
-        force: yes
-      when: caldera_repo.stat.exists
+    - name: Create Podman Compose file (Caldera)
+      copy:
+        dest: "{{ caldera_dir }}/docker-compose.yml"
+        content: |
+          version: '3'
+          services:
+            caldera:
+              image: "{{ caldera_image }}"
+              container_name: "{{ caldera_container_name }}"
+              restart: always
+              ports:
+                - "{{ caldera_port }}:{{ caldera_port }}"
+      when: inventory_hostname == "Caldera"
 
-    - name: Create Python virtual environment
-      command: python3 -m venv {{ caldera_venv }}
-      args:
-        creates: "{{ caldera_venv }}"
-
-    - name: Install Python requirements inside venv
-      command: "{{ caldera_venv }}/bin/pip install -r requirements.txt"
+    - name: Launch Caldera Compose (Podman) if not running
+      shell: |
+        if ! podman ps --format '{{'{{.Names}}'}}' | grep -w "{{ caldera_container_name }}"; then
+          podman-compose up -d
+        fi
       args:
         chdir: "{{ caldera_dir }}"
+      when: inventory_hostname == "Caldera"
 
-    - name: Create CALDERA systemd service
+    - name: Wait briefly for Caldera to start
+      pause:
+        seconds: 10
+      when: inventory_hostname == "Caldera"
+
+    # Patch local.yml
+    - name: Copy current local.yml from container if exists
+      command: podman cp {{ caldera_container_name }}:/usr/src/app/conf/local.yml {{ caldera_dir }}/local.yml
+      register: cp_local
+      ignore_errors: true
+      when: inventory_hostname == "Caldera"
+
+    - name: Slurp original local.yml if exists
+      slurp:
+        src: "{{ caldera_dir }}/local.yml"
+      register: original_local_slurp
+      when: inventory_hostname == "Caldera" and cp_local is succeeded
+
+    - name: Decode original local.yml
+      set_fact:
+        original_local_raw: "{{ original_local_slurp.content | b64decode }}"
+      when: inventory_hostname == "Caldera" and original_local_slurp is defined and original_local_slurp.content is defined
+
+    - name: Parse original local.yml as YAML
+      set_fact:
+        original_local_dict: "{{ original_local_raw | from_yaml }}"
+      when: inventory_hostname == "Caldera" and original_local_raw is defined
+
+    - name: Patch HTTP + users + API keys
+      set_fact:
+        patched_local_dict: >-
+          {{
+            (original_local_dict | default({})) |
+            combine({
+              'app.contact.http': {
+                'enabled': True,
+                'host': '0.0.0.0',
+                'port': caldera_port | int
+              },
+              'users': {
+                'red': { 'red': caldera_password },
+                'blue': { 'blue': caldera_password }
+              },
+              'api_key_red': caldera_red_api_key,
+              'api_key_blue': caldera_blue_api_key
+            }, recursive=True)
+          }}
+      when: inventory_hostname == "Caldera"
+
+    - name: Render patched_local.yml on host
       copy:
-        dest: /etc/systemd/system/caldera.service
+        dest: "{{ caldera_dir }}/patched_local.yml"
+        content: "{{ patched_local_dict | to_nice_yaml(indent=2) }}"
+        mode: "0600"
+        force: yes
+      when: inventory_hostname == "Caldera"
+
+    - name: Push patched local.yml into container
+      command: podman cp {{ caldera_dir }}/patched_local.yml {{ caldera_container_name }}:/usr/src/app/conf/local.yml
+      when: inventory_hostname == "Caldera"
+
+    - name: Restart Caldera container
+      command: podman restart {{ caldera_container_name }}
+      when: inventory_hostname == "Caldera"
+
+    - name: Wait for Caldera HTTP to respond
+      uri:
+        url: "{{ caldera_host }}:{{ caldera_port }}"
+        method: GET
+        return_content: no
+        status_code: [200, 301]
+        timeout: 10
+      register: caldera_response_after_patch
+      retries: 30
+      delay: 5
+      until: caldera_response_after_patch is succeeded
+      when: inventory_hostname == "Caldera"
+
+    - name: Extract creds & API keys
+      set_fact:
+        extracted_data:
+          host: "{{ patched_local_dict['app.contact.http'].host }}"
+          port: "{{ patched_local_dict['app.contact.http'].port }}"
+          users:
+            red:
+              username: "red"
+              password: "{{ patched_local_dict.users.red.red }}"
+              api_key: "{{ patched_local_dict.api_key_red }}"
+            blue:
+              username: "blue"
+              password: "{{ patched_local_dict.users.blue.blue }}"
+              api_key: "{{ patched_local_dict.api_key_blue }}"
+      when: inventory_hostname == "Caldera"
+
+    - name: Save secrets.json
+      copy:
+        dest: "{{ caldera_dir }}/secrets.json"
+        content: "{{ extracted_data | to_nice_json(indent=2) }}"
+        mode: "0600"
+      when: inventory_hostname == "Caldera"
+
+    # ---------------- Deploy agent on T-Pot ----------------
+    - name: Ensure python3 and pip are installed on T-Pot
+      dnf:
+        name:
+          - python3
+          - python3-pip
+        state: present
+      when: inventory_hostname == "T-Pot"
+
+    - name: Create PAW storage directory on T-Pot
+      file:
+        path: /etc/caldera
+        state: directory
+        mode: "0700"
+      when: inventory_hostname == "T-Pot"
+
+    - name: Upload T-Pot agent script with PAW persistence
+      copy:
+        dest: /usr/local/bin/caldera_agent.py
+        mode: "0755"
+        content: |
+          #!/usr/bin/env python3
+          # Caldera agent script (same as original)
+          ...
+      when: inventory_hostname == "T-Pot"
+
+    - name: Install required python packages on T-Pot
+      pip:
+        name:
+          - requests
+          - netifaces
+        executable: pip3
+      when: inventory_hostname == "T-Pot"
+
+    - name: Create systemd service with environment
+      copy:
+        dest: /etc/systemd/system/caldera-agent.service
         content: |
           [Unit]
-          Description=MITRE CALDERA
-          After=network.target
+          Description=Caldera minimal agent
+          After=network-online.target
+          Wants=network-online.target
 
           [Service]
           Type=simple
+          ExecStart=/usr/bin/python3 /usr/local/bin/caldera_agent.py
+          WorkingDirectory=/tmp
+          Restart=always
+          RestartSec=10
           User=root
-          WorkingDirectory={{ caldera_dir }}
-          ExecStart={{ caldera_venv }}/bin/python {{ caldera_dir }}/server.py --insecure --build
-          Restart=on-failure
+          Group=root
+          Environment=USER=root
+          Environment=LOGNAME=root
+          Environment=HOME=/root
+          Environment=PYTHONUNBUFFERED=1
+          StandardOutput=journal
+          StandardError=journal
+          ExecStartPre=/bin/sleep 5
 
           [Install]
           WantedBy=multi-user.target
+      when: inventory_hostname == "T-Pot"
 
-    - name: Reload systemd
+    - name: Enable and start Caldera agent service on T-Pot
       systemd:
         daemon_reload: yes
-
-    - name: Enable and start CALDERA service
-      systemd:
-        name: caldera
-        state: started
+        name: caldera-agent.service
         enabled: yes
+        state: started
+      when: inventory_hostname == "T-Pot"
 
-    - name: Wait for CALDERA to be available
-      wait_for:
-        host: 127.0.0.1
-        port: 8888
-        delay: 5
-        timeout: 800
+    # ---------------- Wait for registration ----------------
+    - name: Wait for agent to register with Caldera
+      shell: |
+        curl -s -H "KEY: {{ caldera_red_api_key }}" \
+          "{{ caldera_host }}:{{ caldera_port }}/api/v2/agents" | \
+        jq -r --arg NAME "{{ hostvars['T-Pot']['ansible_hostname'] }}" \
+          '.[] | select(.host==$NAME) | .paw' | head -1
+      register: agent_paw_check
+      until: agent_paw_check.stdout != ""
+      retries: 20
+      delay: 10
+      changed_when: false
+      when: inventory_hostname == "Caldera"
 
-    - name: Display CALDERA access information
+    - name: Set final agent PAW
+      set_fact:
+        final_agent_paw: "{{ agent_paw_check.stdout }}"
+      when: inventory_hostname == "Caldera"
+
+    - name: Update T-Pot agent with obtained PAW
+      copy:
+        dest: /etc/caldera/agent_paw.json
+        content: |
+          {
+            "paw": "{{ hostvars['Caldera']['final_agent_paw'] }}",
+            "agent_name": "T-Pot-{{ ansible_hostname }}"
+          }
+        mode: "0600"
+      when: inventory_hostname == "T-Pot"
+
+    - name: Restart agent service to use persisted PAW
+      systemd:
+        name: caldera-agent.service
+        state: restarted
+      when: inventory_hostname == "T-Pot"
+
+    - name: Display final agent information
       debug:
-        msg: "CALDERA is running. Access it at http://{{ inventory_hostname }}:8888 with default credentials (red/admin)."
+        msg: |
+          Agent successfully deployed and registered!
+          Display Name: T-Pot-{{ hostvars['T-Pot']['ansible_hostname'] }}
+          PAW: {{ final_agent_paw }}
+          Caldera Server: {{ caldera_host }}:{{ caldera_port }}
+      when: inventory_hostname == "Caldera"
+
+    # ---------------- Verify agent ----------------
+    - name: Verify agent is active in Caldera
+      shell: |
+        curl -s -H "KEY: {{ caldera_red_api_key }}" \
+          "{{ caldera_host }}:{{ caldera_port }}/api/v2/agents" | \
+        jq -r --arg NAME "{{ hostvars['T-Pot']['ansible_hostname'] }}" \
+          '.[] | select(.host==$NAME) | {paw: .paw, last_seen: .last_seen, platform: .platform, status: .status}'
+      register: agent_verify
+      changed_when: false
+      when: inventory_hostname == "Caldera"
+
+    - name: Show agent verification details
+      debug:
+        var: agent_verify.stdout
+      when: inventory_hostname == "Caldera"

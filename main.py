@@ -2,34 +2,10 @@ import os
 import json
 import subprocess
 import paramiko
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 import time
+import re
 from pathlib import Path
-import logging
-
-# -------------------
-# Setup logging
-# -------------------
-logger = logging.getLogger("vm_manager")
-logger.setLevel(logging.DEBUG)
-
-# Console handler
-ch = logging.StreamHandler()
-ch.setLevel(logging.DEBUG)
-
-# File handler
-log_file_path = os.path.join(os.getcwd(), "vm_manager.log")
-fh = logging.FileHandler(log_file_path)
-fh.setLevel(logging.DEBUG)
-
-# Formatter
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-ch.setFormatter(formatter)
-fh.setFormatter(formatter)
-
-# Add handlers
-logger.addHandler(ch)
-logger.addHandler(fh)
 
 # -------------------
 # Load environment
@@ -41,236 +17,188 @@ BASE_VM_PATH = os.getenv("BASE_VM_PATH")
 BASE_VM_USERNAME = os.getenv("BASE_VM_USERNAME")
 BASE_VM_PASSWORD = os.getenv("BASE_VM_PASSWORD")
 
-
 # -------------------
-# VM functions
+# Utility functions
 # -------------------
-def create_vms():
-    with open("vms.json", "r") as f:
-        vms = json.load(f)
-
-    for vm in vms:
-        name = vm["name"]
-        path = vm.get("path")
-        ip = vm.get("ip")
-
-        if path is not None and ip is not None and not os.path.exists(path):
-            vm["path"] = None
-            vm["ip"] = None
-
-        if path is None or ip is None:
-            vm_path = os.path.join(BASE_VM_DIR, name, f"{name}.vmx")
-            clone_cmd = [
-                "vmrun",
-                "clone",
-                BASE_VM_PATH,
-                vm_path,
-                "full",
-                "--cloneName=" + name,
-            ]
-
-            logger.info(f"Cloning VM {name}...")
-            subprocess.run(clone_cmd, check=True)
-
-            start_cmd = ["vmrun", "start", vm_path, "gui"]
-            logger.info(f"Starting VM {name}...")
-            subprocess.run(start_cmd, check=True)
-
-            logger.info(f"Waiting for VM {name} to get IP...")
-            while True:
-                time.sleep(1)
-                ip_cmd = ["vmrun", "getGuestIPAddress", vm_path, "-wait"]
-                try:
-                    ip = subprocess.check_output(ip_cmd).decode().strip()
-                    if ip:
-                        break
-                except subprocess.CalledProcessError:
-                    continue
-
-            vm["path"] = vm_path
-            vm["ip"] = ip
-
-            with open("vms.json", "w") as f:
-                json.dump(vms, f, indent=4)
-
-            logger.info(f"VM {name} is ready at IP {ip}")
+def load_vms():
+    with open("vms.json", "r", encoding="utf-8", errors="ignore") as f:
+        return json.load(f)
 
 
-def configure_ansible_master():
-    with open("vms.json", "r") as f:
-        vms = json.load(f)
+def save_vms(vms):
+    with open("vms.json", "w", encoding="utf-8", errors="ignore") as f:
+        json.dump(vms, f, indent=4)
 
-    ansible_master_ip = None
-    for vm in vms:
-        if vm["name"] == "Ansible":
-            ansible_master_ip = vm["ip"]
-            break
 
-    if ansible_master_ip is None:
-        logger.critical("Ansible Master has no IP")
-        exit(1)
-        return
+def create_vm(vm):
+    name = vm["name"]
+    path, ip = vm.get("path"), vm.get("ip")
 
-    # Remove Ansible Master from target hosts
-    target_vms = [
-        vm for vm in vms if vm["name"] != "Ansible" and vm["state"] == "start"
-    ]
+    if path and ip and os.path.exists(path):
+        return vm
 
-    logger.info("Connecting to Ansible Master via SSH...")
+    vm_path = os.path.join(BASE_VM_DIR, name, f"{name}.vmx")
+    clone_cmd = ["vmrun", "clone", BASE_VM_PATH, vm_path, "full", f"--cloneName={name}"]
+
+    print(f"[+] Cloning VM {name}...")
+    subprocess.run(clone_cmd, check=True)
+
+    print(f"[+] Starting VM {name}...")
+    subprocess.run(["vmrun", "start", vm_path, "gui"], check=True)
+
+    print(f"[~] Waiting for VM {name} to get IP...")
+    while True:
+        time.sleep(1)
+        try:
+            ip = (
+                subprocess.check_output(
+                    ["vmrun", "getGuestIPAddress", vm_path, "-wait"]
+                )
+                .decode()
+                .strip()
+            )
+            if ip:
+                break
+        except subprocess.CalledProcessError:
+            continue
+
+    vm["path"] = vm_path.replace("\\", "/")
+    vm["ip"] = ip
+    print(f"[✓] VM {name} ready at {ip}")
+    return vm
+
+
+def boot_vm(vm):
+    path = vm.get("path")
+    if path:
+        print(f"[+] Booting VM {vm['name']}...")
+        subprocess.run(["vmrun", "start", path, "gui"], check=True)
+
+
+def ssh_connect(ip, port=22):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(ansible_master_ip, username=BASE_VM_USERNAME, password=BASE_VM_PASSWORD)
+    ssh.connect(ip, username=BASE_VM_USERNAME, password=BASE_VM_PASSWORD, port=port)
+    return ssh
+
+
+def copy_files(ssh, local_dir, remote_base_dir, vms=None):
+    sftp = ssh.open_sftp()
+
+    def upload_dir(local_path, remote_path):
+        try:
+            sftp.mkdir(remote_path)
+        except IOError:
+            pass
+        for item in Path(local_path).iterdir():
+            remote_item = f"{remote_path}/{item.name}"
+            if item.is_dir():
+                upload_dir(item, remote_item)
+            elif item.is_file():
+                with open(item, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+
+                    # Replace VM IP placeholders
+                    if vms:
+                        for vm in vms:
+                            placeholder_key = f"{vm['name']}_IP"
+                            content = re.sub(
+                                r"\{\s*\{\s*" + re.escape(placeholder_key) + r"\s*\}\s*\}",
+                                vm["ip"],
+                                content,
+                            )
+
+                    # Replace .env variables
+                    for key, value in dotenv_values(".env").items():
+                        content = re.sub(
+                            r"\{\s*\{\s*" + re.escape(key) + r"\s*\}\s*\}",
+                            value,
+                            content,
+                        )
+
+                with sftp.file(remote_item, "w") as remote_file:
+                    remote_file.write(content)
+                sftp.chmod(remote_item, 0o644)
+
+    upload_dir(local_dir, remote_base_dir)
+    sftp.close()
+
+
+# -------------------
+# Main execution
+# -------------------
+if __name__ == "__main__":
+    vms = load_vms()
+
+    # 1. Create/ensure VMs ready
+    for idx, vm in enumerate(vms):
+        vms[idx] = create_vm(vm)
+    save_vms(vms)
+
+    # 2. Boot all VMs marked 'start'
+    for vm in [v for v in vms if v.get("state", "stop") == "start"]:
+        boot_vm(vm)
+
+    # 3. Configure Ansible Master
+    Ansible_ip = next((vm["ip"] for vm in vms if vm["name"] == "Ansible"), None)
+    if not Ansible_ip:
+        print("[x] Ansible Master has no IP")
+        exit(1)
+
+    ssh = ssh_connect(Ansible_ip)
 
     commands = [
-        "apt-get install -y ansible ansible-core python3-pip sshpass tree jq 7zip nmap",
-        "ansible-galaxy collection install ansible.posix community.general community.docker",
+        f"subscription-manager register --force --username '{os.getenv('REDHAT_USERNAME')}' --password '{os.getenv('REDHAT_PASSWORD')}'",
+        "dnf install -y ansible-core python3-pip sshpass tree jq nmap",
+        "ansible-galaxy collection install ansible.posix community.general",
         "echo '[defaults]' | tee /root/ansible.cfg",
+        "echo 'forks = 20' | tee -a /root/ansible.cfg",
         "echo 'inventory = /root/inventory' | tee -a /root/ansible.cfg",
         "echo 'deprecation_warnings = False' | tee -a /root/ansible.cfg",
         "echo '[all]' | tee /root/inventory",
     ]
 
+    target_vms = [vm for vm in vms if vm["name"] != "Ansible" and vm.get("state") == "start"]
     for vm in target_vms:
         safe_name = vm["name"].replace(" ", "-")
+        port = int(os.getenv("T_POT_PORT")) if vm["name"] == "T-Pot" else 22
         commands.append(
-            f"echo '{safe_name} ansible_host={vm['ip']} ansible_python_interpreter=/usr/bin/python3' | tee -a /root/inventory"
+            f"grep -q '{safe_name} ansible_host={vm['ip']}' /root/inventory || echo '{safe_name} ansible_host={vm['ip']} python_interpreter=/usr/bin/python3 ansible_port={port}' | tee -a /root/inventory"
+
         )
-        commands.append(f"echo '{vm['ip']} {safe_name}' | tee -a /etc/hosts")
+        commands.append(
+            f"grep -q '{vm['ip']} {safe_name}' /etc/hosts || echo '{vm['ip']} {safe_name}' | tee -a /etc/hosts"
+        )
 
     for cmd in commands:
         stdin, stdout, stderr = ssh.exec_command(cmd)
         exit_status = stdout.channel.recv_exit_status()
-        out, err = stdout.read().decode(), stderr.read().decode()
-        if out:
-            logger.info(f"Command {cmd} executed successfully")
-        elif err:
-            logger.error(f"Command {cmd} failed: {err}")
-            exit(1)
-        elif exit_status != 0:
-            logger.critical(f"Command failed: {cmd}")
+        if exit_status == 0:
+            print(f"[✓] {cmd}")
+        else:
+            print(f"[x] Failed: {cmd}\n{stderr.read().decode()}")
             exit(1)
 
-    # SSH key generation and copy
-    logger.info("Generating SSH key and copying to target VMs...")
-    ssh.exec_command("mkdir /root/.ssh/")
-    ssh.exec_command("touch /root/.ssh/id_rsa")
-    ssh.exec_command("chmod 0600 /root/.ssh/id_rsa")
-    ssh.exec_command("ssh-keygen -t rsa -b 2048 -f /root/.ssh/id_rsa -q -N '' -y")
+    # SSH key setup
+    ssh.exec_command("rm -rf /root/.ssh && mkdir -p /root/.ssh && chmod 700 /root/.ssh")
+    ssh.exec_command("ssh-keygen -t rsa -b 2048 -f /root/.ssh/id_rsa -q -N '' <<< y")
+    ssh.exec_command("chmod 600 /root/.ssh/id_rsa /root/.ssh/id_rsa.pub")
 
     for vm in target_vms:
-        cmd = f"sshpass -p '{BASE_VM_PASSWORD}' ssh-copy-id -f -o StrictHostKeyChecking=no {BASE_VM_USERNAME}@{vm['ip']}"
+        port = int(os.getenv("T_POT_PORT")) if vm["name"] == "T-Pot" else 22
+        cmd = f"sshpass -p '{BASE_VM_PASSWORD}' ssh-copy-id -f -o StrictHostKeyChecking=no -p {port} {BASE_VM_USERNAME}@{vm['ip']}"
+        time.sleep(2)
         stdin, stdout, stderr = ssh.exec_command(cmd)
         exit_status = stdout.channel.recv_exit_status()
-        out, err = stdout.read().decode(), stderr.read().decode()
-        if out:
-            logger.info(f"Command {cmd} executed successfully")
-        elif err:
-            logger.error(f"Command {cmd} failed")
-            exit(1)
-        elif exit_status != 0:
-            logger.critical(f"Failed to copy SSH key to {vm['name']}")
+        if exit_status == 0:
+            print(f"[✓] Key copied to {vm['name']}")
+        else:
+            print(f"[x] Failed to copy key to {vm['name']}")
             exit(1)
 
-    ssh.close()
-    logger.info("Ansible Master configuration complete.")
-
-
-def boot_all_vms():
-    with open("vms.json", "r") as f:
-        vms = json.load(f)
-
-    for vm in [v for v in vms if v.get("state", "stop") == "start"]:
-        path = vm.get("path")
-        if path:
-            logger.info(f"Booting VM {vm['name']}...")
-            subprocess.run(["vmrun", "start", path, "gui"], check=True)
-
-    # time.sleep(20)
-
-
-def stop_all_vms():
-    with open("vms.json", "r") as f:
-        vms = json.load(f)
-
-    for vm in vms:
-        path = vm.get("path")
-        if path:
-            logger.info(f"Stopping VM {vm['name']}...")
-            subprocess.run(["vmrun", "stop", path, "hard"], check=True)
-
-
-def execute_playbooks():
-    with open("vms.json", "r") as f:
-        vms = json.load(f)
-
-    ansible_master_ip = next((vm["ip"] for vm in vms if vm["name"] == "Ansible"), None)
-
-    if not ansible_master_ip:
-        logger.error("Ansible Master has no IP")
-        return
-
-    logger.info("Connecting to Ansible Master to execute playbooks...")
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(ansible_master_ip, username=BASE_VM_USERNAME, password=BASE_VM_PASSWORD)
-
-    sftp = ssh.open_sftp()
-    local_playbooks_dir = Path("playbooks")
-    remote_playbooks_dir = "/root/playbooks"
-
-    try:
-        sftp.mkdir(remote_playbooks_dir)
-    except IOError:
-        pass
-
-    for item in local_playbooks_dir.iterdir():
-        if item.is_file() and item.suffix in {".yml", ".yaml"}:
-            logger.info(f"Uploading {item.name} to Ansible Master...")
-            sftp.put(str(item), f"{remote_playbooks_dir}/{item.name}")
-
-    sftp.close()
-
-    # Load playbooks.json
-    with open("playbooks.json", "r") as f:
-        playbooks = json.load(f)
-
-    """
-    # Loop over JSON config
-    for pb in playbooks:
-        # Check flags
-        if pb.get("execute_deletion", False):
-            cmd = f"ansible-playbook {remote_playbooks_dir}/{pb['deletion']}"
-            logger.info(f"Executing deletion for {pb['name']}...")
-            stdin, stdout, stderr = ssh.exec_command(cmd)
-            stdout.channel.recv_exit_status()
-            out, err = stdout.read().decode(), stderr.read().decode()
-            if out:
-                logger.info(f"Deletion playbook executed successfully for {pb['name']}")
-            if err:
-                logger.critical(f"Deletion playbook failed for {pb['name']}: {err}")
-
-        if pb.get("execute_installation", False):
-            cmd = f"ansible-playbook {remote_playbooks_dir}/{pb['installation']}"
-            logger.info(f"Executing installation for {pb['name']}...")
-            stdin, stdout, stderr = ssh.exec_command(cmd)
-            stdout.channel.recv_exit_status()
-            out, err = stdout.read().decode(), stderr.read().decode()
-            if out:
-                logger.info(
-                    f"Installation playbook executed successfully for {pb['name']}"
-                )
-            if err:
-                logger.critical(f"Installation playbook failed for {pb['name']}: {err}")
-    """
+    # 4. Copy folders
+    for folder in ["playbooks", "scripts", "manifests", "web-application"]:
+        copy_files(ssh, folder, f"/root/{folder}", vms=target_vms)
 
     ssh.close()
-    logger.info("All playbooks executed.")
-
-
-if __name__ == "__main__":
-    create_vms()
-    boot_all_vms()
-    configure_ansible_master()
-    execute_playbooks()
-    # stop_all_vms()
-    ...
+    print("[✓] All VM setup tasks completed.")

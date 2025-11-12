@@ -1,0 +1,75 @@
+---
+- name: Delete Web Application Podman images and GHCR packages
+  hosts: PAM-WK-1, PAM-WK-2
+  become: true
+  vars:
+    ghcr_user: "{{ GHCR_USERNAME }}"
+    ghcr_token: "{{ GHCR_TOKEN }}"
+    frontend_image: "{{ K8S_FRONTEND_DEPLOYMENT }}"
+
+  tasks:
+    - name: Log in to GitHub Container Registry
+      shell: |
+        echo "{{ ghcr_token }}" | podman login ghcr.io -u {{ ghcr_user }} --password-stdin
+      ignore_errors: true
+
+    - name: Stop and remove all local containers
+      shell: |
+        podman ps -aq | xargs -r podman rm -f
+      ignore_errors: true
+
+    - name: Remove all local Podman images
+      shell: |
+        podman rmi -a -f || true
+      ignore_errors: true
+
+    - name: Delete frontend image from GHCR
+      shell: |
+        curl -sL -X DELETE \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer {{ ghcr_token }}" \
+          "https://api.github.com/user/packages/container/{{ frontend_image }}"
+      ignore_errors: true
+
+- name: Delete Web Application deployment from k3s
+  hosts: CP1
+  become: true
+  gather_facts: false
+  vars:
+    remote_manifest_dir: /root/manifests
+    k8s_namespace: "{{ K8S_NAMESPACE }}"
+    ghcr_secret_name: ghcr-pull-secret
+    backend_image: "{{ K8S_BACKEND_IMAGE }}"
+    frontend_image: "{{ K8S_FRONTEND_IMAGE }}"
+
+  tasks:
+    - name: Delete all Kubernetes resources in manifests
+      shell: |
+        KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+        /usr/local/bin/kubectl delete -f "{{ remote_manifest_dir }}" --recursive --ignore-not-found
+      args:
+        executable: /bin/bash
+      failed_when: false
+
+    - name: Delete GHCR pull secret if exists
+      shell: |
+        KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+        /usr/local/bin/kubectl delete secret "{{ ghcr_secret_name }}" -n "{{ k8s_namespace }}" --ignore-not-found
+      args:
+        executable: /bin/bash
+      failed_when: false
+
+    - name: Delete namespace if empty
+      shell: |
+        KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+        if [ "$(/usr/local/bin/kubectl get all -n {{ k8s_namespace }} --no-headers | wc -l)" -eq 0 ]; then
+          /usr/local/bin/kubectl delete ns "{{ k8s_namespace }}" || true
+        fi
+      args:
+        executable: /bin/bash
+      failed_when: false
+
+    - name: Remove local frontend images from CRI
+      shell: |
+        crictl rmi {{ frontend_image }} || true
+      ignore_errors: true

@@ -1,0 +1,599 @@
+---
+- name: Deploy n8n Automation Platform with Predefined Workflows
+  hosts: Blue
+  vars:
+    n8n_dir: "{{ N8N_DIR }}"
+    workflows_dir: "{{ WORKFLOWS_DIR }}"
+    n8n_user: "{{ N8N_USER }}"
+    n8n_pass: "{{ N8N_PASSWORD }}"
+    n8n_host: "{{ N8N_HOST }}"
+    n8n_port: "{{ N8N_PORT }}"
+    n8n_container_name: "{{ N8N_CONTAINER_NAME }}"
+    n8n_image: "{{ N8N_IMAGE }}"
+    n8n_api_key: "{{ N8N_API_KEY }}"
+    honeypot_ip: "{{ HONEYPOT_IP }}"
+    honeypot_port: "{{ T_POT_PORT }}"
+    honeypot_ssh_username: "{{ BASE_VM_USERNAME }}"
+    honeypot_ssh_password: "{{ BASE_VM_PASSWORD }}"
+    caldera_ip: "{{ CALDERA_IP }}"
+    grafana_username: "{{ GRAFANA_USER }}"
+    grafana_password: "{{ GRAFANA_PASSWORD }}"
+    discord_webhook: "{{ DISCORD_WEBHOOK }}"
+    mongo_container_name: "{{ MONGO_CONTAINER_NAME }}"
+    mongo_container_port: "{{ MONGO_CONTAINER_PORT }}"
+    mongo_database: "{{ MONGO_DB_NAME }}"
+    mongo_username: "{{ MONGO_USERNAME }}"
+    mongo_password: "{{ MONGO_PASSWORD }}"
+
+  tasks:
+    - name: "[N8N] Ensure required variables are defined"
+      assert:
+        that:
+          - n8n_dir is defined
+          - n8n_user is defined
+          - n8n_pass is defined
+          - n8n_host is defined
+          - n8n_port is defined
+          - discord_webhook is defined
+          - grafana_username is defined
+          - grafana_password is defined
+        fail_msg: "Missing one or more required n8n variables."
+
+    # Install sqlite3 for n8n
+    - name: "[N8N] Install sqlite3"
+      dnf:
+        name: sqlite3
+        state: present
+
+    # ============================================================
+    # n8n Installation and Workflow Setup
+    # ============================================================
+    - name: "[N8N] Ensure n8n directory exists"
+      file:
+        path: "{{ n8n_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: "[N8N] Ensure workflows directory exists"
+      file:
+        path: "{{ workflows_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Delete existing n8n container if it exists and its volume
+      command: podman rm -f {{ n8n_container_name }} #&& podman volume rm -f {{ n8n_container_name }}_data
+
+    - name: "[N8N] Create docker-compose.yml for n8n"
+      copy:
+        dest: "{{ n8n_dir }}/docker-compose.yml"
+        content: |
+          version: "3"
+          services:
+            n8n:
+              image: "{{ n8n_image }}"
+              container_name: "{{ n8n_container_name }}"
+              restart: always
+              ports:
+                - "{{ n8n_port }}:{{ n8n_port }}"
+              environment:
+                - N8N_BASIC_AUTH_ACTIVE=true
+                - N8N_BASIC_AUTH_USER={{ n8n_user | regex_replace('^"|"$', '') }}
+                - N8N_BASIC_AUTH_PASSWORD={{ n8n_pass | regex_replace('^"|"$', '') }}
+                - N8N_SECURE_COOKIE=false
+                - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+                - DB_SQLITE_POOL_SIZE=5
+                - N8N_RUNNERS_ENABLED=true
+                - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+                - N8N_PUBLIC_API_ENABLED=true
+                - WEBHOOK_URL={{ n8n_host }}:{{ n8n_port }}/
+              volumes:
+                - data:/home/node/.n8n
+                - {{ workflows_dir }}:/workflows
+
+          volumes:
+            data:
+
+    - name: "[N8N] Install Podman and podman-compose (if not present)"
+      dnf:
+        name:
+          - podman
+          - podman-compose
+        state: present
+
+    - name: "[N8N] Enable and start Podman"
+      systemd:
+        name: podman
+        state: started
+        enabled: true
+
+    - name: "[N8N] Start n8n"
+      command: podman-compose -f "{{ n8n_dir }}/docker-compose.yml" up -d
+      args:
+        chdir: "{{ n8n_dir }}"
+
+    - name: "[N8N] Wait for n8n HTTP to be ready"
+      uri:
+        url: "{{ n8n_host }}:{{ n8n_port }}"
+        method: GET
+        return_content: no
+        status_code: 200
+        timeout: 10
+        user: '{{ n8n_user | regex_replace(''^"|",'', '''') }}'
+        password: '{{ n8n_pass | regex_replace(''^"|",'', '''') }}'
+        force_basic_auth: true
+      register: n8n_response
+      retries: 30
+      delay: 10
+      until: n8n_response.status == 200
+      ignore_errors: true
+
+    # -------------------------------
+    # CREATE DISCORD WEBHOOK CREDENTIALS
+    # -------------------------------
+    - name: "[N8N] Create credentials JSON file"
+      copy:
+        dest: "{{ workflows_dir }}/credentials.json"
+        content: |
+          [
+            {
+              "id": "1",
+              "name": "Discord Security Alerts",
+              "type": "discordWebhookApi",
+              "data": {
+                "webhookUri": "{{ discord_webhook | regex_replace('^"|"$', '') }}"
+              }
+            },
+            {
+              "id": "2",
+              "name": "Honeypot SSH",
+              "type": "sshPassword",
+              "data": {
+                "host": "{{ honeypot_ip }}",
+                "port": "{{ honeypot_port }}",
+                "username": "{{ honeypot_ssh_username }}",
+                "password": "{{ honeypot_ssh_password }}"
+              }
+            },
+            {
+              "id": "3",
+              "name": "MongoDB Aegis",
+              "type": "mongoDb",
+              "data": {
+                "configurationType": "values",
+                "host": "{{ mongo_container_name }}",
+                "port": {{ mongo_container_port }},
+                "database": "{{ mongo_database }}",
+                "user": "{{ mongo_username }}",
+                "password": "{{ mongo_password }}",
+                "useTLS": false
+              }
+            }
+          ]
+
+    - name: "[N8N] Import credentials into n8n"
+      command: podman exec {{ n8n_container_name }} n8n import:credentials --input=/workflows/credentials.json
+      register: credentials_import
+      ignore_errors: true
+      changed_when: "'Successfully imported' in credentials_import.stdout"
+
+    - name: "[N8N] Display credentials import result"
+      debug:
+        msg: "{{ credentials_import.stdout }}"
+      when: credentials_import.stdout is defined
+
+    # -------------------------------
+    # WORKFLOW DEFINITIONS (Updated with credential references)
+    # -------------------------------
+
+    - name: "[N8N] Create AI Security Automation Workflow"
+      copy:
+        dest: "{{ workflows_dir }}/ai-security-automation.json"
+        content: |
+          {% raw %}
+          {
+            "name": "AI Security Automation - Grafana Alert to Block",
+            "autoSave": true,
+            "active": false,
+            "nodes": [
+              {
+                "parameters": {
+                  "path": "grafana-alert",
+                  "responseMode": "onReceived",
+                  "httpMethod": "POST",
+                  "sendBody": true,
+                  "contentType": "json",
+                  "bodyParameters": {
+                    "parameters": []
+                  },
+                  "options": {}
+                },
+                "name": "Grafana Webhook",
+                "type": "n8n-nodes-base.webhook",
+                "typeVersion": 2,
+                "position": [240, 300],
+                "webhookId": "grafana-alert-webhook"
+              },
+              {
+                "parameters": {
+                  "method": "GET",
+                  "url": "=http://{{ LOKI_IP }}:3100/loki/api/v1/query_range?query={{ encodeURIComponent($json.query) }}&start={{ $json.start }}&end={{ $json.end }}&limit={{ $json.limit }}",
+                  "options": {}
+                },
+                "name": "Fetch Loki Logs",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.2,
+                "position": [720, 300]
+              },
+              {
+                "parameters": {
+                  "jsCode": "// Extract src_ip from Grafana alert\nconst srcIp = $input.first().json.body.alerts[0].valueString.match(/src_ip=([^}]+)/)[1];\n\n// Set query parameters for Loki\nconst now = Math.floor(Date.now() / 1000);\nconst start = now - 900; // 15 minutes ago\n\nreturn {\n  src_ip: srcIp,\n  query: `{job=\"honeypot-logs\", src_ip=\"${srcIp}\"}`,\n  limit: 5,\n  start: start,\n  end: now\n};"
+                },
+                "name": "Build Loki Query",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [480, 300]
+              },
+              {
+                "parameters": {
+                  "jsCode": "// Parse Loki response and prepare for AI analysis\nconst logsData = $input.first().json;\nconst srcIp = $('Fetch Loki Logs').first().json.src_ip;\n\nlet logEntries = [];\nif (logsData.data && logsData.data.result) {\n  logsData.data.result.forEach(result => {\n    if (result.values) {\n      result.values.forEach(value => {\n        // Escape only quotes and backslashes for JSON safety\n        let log = value[1];\n          logEntries.push(log);\n      });\n    }\n  });\n}\n\nconst logsText = logEntries.slice(0, 1).join('\\\\n');\n\n// Build prompt with minimal necessary escaping\nconst prompt = `Consider yourself a cybersecurity specialist and architect and determine if it's a real attack or not. Return ONLY valid JSON without (```json and \n) and with this structure: {\\\"is_attack\\\": boolean, \\\"confidence\\\": number(0-100 as integer), \\\"attack_type\\\": string (note empty even low confidence), \\\"threat_level\\\": \\\"low|medium|high|critical\\\", \\\"recommendation\\\": string (note empty even low confidence)}\\\\nNOTE: All fields are required and must have values no matter what is the confidence\\\\nSource IP: ${srcIp}\\\\nLogs: ${logsText}`;\n\n// Final escape for JSON string embedding\nconst escapedPrompt = prompt\n  .replace(/\\\\/g, '\\\\\\\\')\n  .replace(/\"/g, '\\\\\"');\n\nreturn {\n  model: \"phi4-mini:latest\",\n  prompt: escapedPrompt\n};"
+                },
+                "name": "Prepare AI Prompt",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [960, 300]
+              },
+              {
+                "parameters": {
+                  "method": "POST",
+                  "url": "{{ OLLAMA_HOST }}{{ OLLAMA_ENDPOINT }}",
+                  "sendBody": true,
+                  "contentType": "json",
+                  "bodyParameters": {
+                    "parameters": [
+                      {
+                        "name": "model",
+                        "value": "={{ $json.model }}"
+                      },
+                      {
+                        "name": "messages",
+                        "value": [{"role": "user", "content": "={{ $json.prompt }}"}]
+                      },
+                      {
+                        "name": "stream",
+                        "value": false
+                      }
+                    ]
+                  },
+                  "options": {}
+                },
+                "name": "AI Analysis - Ollama",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4.2,
+                "position": [1200, 300]
+              },
+              {
+                "parameters": {
+                  "jsCode": "// --- Parse AI Response Safely ---\nlet aiResponse;\ntry {\n    let responseText = $('AI Analysis').first().json.message.content;\n\n    // Clean up potential code fences\n    responseText = responseText.replace(/```(json)?/g, '').trim();\n\n    // Parse JSON\n    aiResponse = JSON.parse(responseText);\n} catch (e) {\n    aiResponse = {\n        is_attack: false,\n        confidence: 0,\n        attack_type: \"\",\n        severity: \"low\",\n        recommendation: \"Unable to parse AI response\"\n    };\n}\n\n// --- Extract Context from Other Nodes ---\nconst srcIp = $('Prepare AI Prompt').first().json.src_ip;\nconst grafanaAlert = $('Grafana Webhook').first().json.body.alerts[0];\nconst labels = grafanaAlert.labels || {};\nconst annotations = grafanaAlert.annotations || {};\n\n// --- Extract Loki Logs (second element of each value pair) ---\nlet logLines = [];\ntry {\n    const results = $('Fetch Loki Logs').first().json.data?.result ?? [];\n    for (const stream of results) {\n        if (Array.isArray(stream.values)) {\n            const lines = stream.values.map(v => v[1]); // second item = log text\n            logLines.push(...lines);\n        }\n    }\n} catch (err) {\n    logLines = ['Unable to retrieve logs'];\n}\n\n// Optional: cap number of log lines\nlogLines = logLines.slice(0, 20);\n\n// --- Decision Logic ---\nconst confidence = Number(aiResponse.confidence) || 0;\nconst isAttack = Boolean(aiResponse.is_attack);\nconst shouldBlock = confidence >= 70 && isAttack;\n\n// --- Return Final Flattened Object ---\nreturn {\n    timestamp: new Date(grafanaAlert.startsAt).toISOString(),\n    alert_name: String(labels.alertname || \"Unknown Alert\"),\n    alert_description: String(annotations.description || \"\"),\n    source_ip: String(srcIp || \"unknown\"),\n\n    // AI + Decision Fields (typed)\n    should_block: Boolean(shouldBlock),\n    block_reason: shouldBlock\n        ? `AI detected ${aiResponse.attack_type || \"unknown\"} with ${confidence}% confidence`\n        : \"Low confidence or false positive\",\n    is_attack: Boolean(isAttack),\n    confidence: Number(confidence),\n    attack_type: String(aiResponse.attack_type || \"\"),\n    severity: String(aiResponse.severity || labels.severity || \"low\"),\n    recommendation: String(aiResponse.recommendation || \"\"),\n\n    // Logs\n    logs: Array.isArray(logLines) ? logLines : []\n};"
+                },
+                "name": "AI Decision Engine",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [1440, 300]
+              },
+              {
+                "parameters": {
+                  "conditions": {
+                    "options": {
+                      "caseSensitive": true,
+                      "leftValue": "",
+                      "typeValidation": "strict"
+                    },
+                    "conditions": [
+                      {
+                        "id": "should_block_condition",
+                        "leftValue": "={{ $json.should_block }}",
+                        "rightValue": true,
+                        "operator": {
+                          "type": "boolean",
+                          "operation": "equals"
+                        }
+                      }
+                    ],
+                    "combinator": "and"
+                  },
+                  "options": {}
+                },
+                "name": "High Confidence Attack?",
+                "type": "n8n-nodes-base.if",
+                "typeVersion": 2,
+                "position": [1680, 300]
+              },
+              {
+                "parameters": {
+                  "operation": "insert",
+                  "collection": "alerts",
+                  "document": {
+                    "timestamp": "={{ $json.timestamp }}",
+                    "alert_name": "={{ $json.alert_name }}",
+                    "alert_description": "={{ $json.alert_description }}",
+                    "source_ip": "={{ $json.source_ip }}",
+                    "should_block": "={{ $json.should_block }}",
+                    "block_reason": "={{ $json.block_reason }}",
+                    "is_attack": "={{ $json.is_attack }}",
+                    "confidence": "={{ $json.confidence }}",
+                    "attack_type": "={{ $json.attack_type }}",
+                    "severity": "={{ $json.severity }}",
+                    "recommendation": "={{ $json.recommendation }}",
+                    "logs": "={{ $json.logs }}"
+                  },
+                  "options": {}
+                },
+                "name": "Save Alert to MongoDB",
+                "type": "n8n-nodes-base.mongoDb",
+                "typeVersion": 1,
+                "position": [1900, 200],
+                "credentials": {
+                  "mongoDb": {
+                    "id": "3",
+                    "name": "MongoDB Aegis"
+                  }
+                }
+              },
+              {
+                "parameters": {
+                  "command": "=sudo iptables -A INPUT -s '{{ $json.source_ip }}' -j DROP && echo '{{ $json.source_ip }}' >> /var/log/blocked_ips.txt",
+                  "workingDirectory": "/"
+                },
+                "name": "Block Attacker IP",
+                "type": "n8n-nodes-base.ssh",
+                "typeVersion": 1,
+                "position": [2100, 200],
+                "credentials": {
+                  "sshPassword": {
+                    "id": "2",
+                    "name": "Honeypot SSH"
+                  }
+                }
+              },
+              {
+                "parameters": {
+                  "authentication": "webhook",
+                 "content": "={{ '🚨 **CRITICAL SECURITY ALERT** 🚨\\n\\n**Alert Name:** ' + $json.alert_name + '\\n**Description:** ' + $json.alert_description + '\\n**Source IP:** ' + $json.source_ip + '\\n**Attack Type:** ' + ($json.attack_type || 'N/A') + '\\n**Confidence:** ' + ($json.confidence || 0) + '%\\n**Severity:** ' + ($json.severity || 'low').toUpperCase() + '\\n**Recommendation:** ' + ($json.recommendation || 'No recommendation available') + '\\n\\n**🛑 Action:** ' + ($json.should_block ? 'Attacker has been blocked via firewall' : 'Manual review required') }}"
+                },
+                "name": "Discord - Critical Alert",
+                "type": "n8n-nodes-base.discord",
+                "typeVersion": 2,
+                "position": [2300, 200],
+                "credentials": {
+                  "discordWebhookApi": {
+                    "id": "1",
+                    "name": "Discord Security Alerts"
+                  }
+                }
+              },
+              {
+                "parameters": {
+                  "authentication": "webhook",
+                  "content": "={{ 'ℹ️ **Security Alert - Low Confidence**\\n\\n**Alert Name:** ' + $json.alert_name + '\\n**Description:** ' + $json.alert_description + '\\n**Source IP:** ' + $json.source_ip + '\\n**Attack Type:** ' + ($json.attack_type || 'N/A') + '\\n**Confidence:** ' + ($json.confidence || 0) + '%\\n**Severity:** ' + ($json.severity || 'low').toUpperCase() + '\\n**Block Reason:** ' + ($json.block_reason || 'Not applicable') + '\\n**Status:** ' + ($json.should_block ? '🚫 Blocked by system' : '✅ Not blocked (below threshold)') + '\\n**Recommendation:** ' + ($json.recommendation || 'No specific recommendation') }}"
+                },
+                "name": "Discord - False Positive",
+                "type": "n8n-nodes-base.discord",
+                "typeVersion": 2,
+                "position": [1900, 400],
+                "credentials": {
+                  "discordWebhookApi": {
+                    "id": "1",
+                    "name": "Discord Security Alerts"
+                  }
+                }
+              }
+            ],
+            "connections": {
+              "Grafana Webhook": {
+                "main": [
+                  [
+                    {
+                      "node": "Build Loki Query",
+                      "type": "main",
+                      "index": 0
+                    }
+                  ]
+                ]
+              },
+              "Build Loki Query": {
+                "main": [
+                  [
+                    {
+                      "node": "Fetch Loki Logs",
+                      "type": "main",
+                      "index": 0
+                    }
+                  ]
+                ]
+              },
+              "Fetch Loki Logs": {
+                "main": [
+                  [
+                    {
+                      "node": "Prepare AI Prompt",
+                      "type": "main",
+                      "index": 0
+                    }
+                  ]
+                ]
+              },
+              "Prepare AI Prompt": {
+                "main": [
+                  [
+                    {
+                      "node": "AI Analysis - Ollama",
+                      "type": "main",
+                      "index": 0
+                    }
+                  ]
+                ]
+              },
+              "AI Analysis - Ollama": {
+                "main": [
+                  [
+                    {
+                      "node": "AI Decision Engine",
+                      "type": "main",
+                      "index": 0
+                    }
+                  ]
+                ]
+              },
+              "AI Decision Engine": {
+                "main": [
+                  [
+                    {
+                      "node": "High Confidence Attack?",
+                      "type": "main",
+                      "index": 0
+                    }
+                  ]
+                ]
+              },
+              "High Confidence Attack?": {
+                "main": [
+                  [
+                    {
+                      "node": "Save Alert to MongoDB",
+                      "type": "main",
+                      "index": 0
+                    }
+                  ],
+                  [
+                    {
+                      "node": "Discord - False Positive",
+                      "type": "main",
+                      "index": 0
+                    }
+                  ]
+                ]
+              },
+              "Save Alert to MongoDB": {
+                "main": [
+                  [
+                    {
+                      "node": "Block Attacker IP",
+                      "type": "main",
+                      "index": 0
+                    }
+                  ]
+                ]
+              },
+              "Block Attacker IP": {
+                "main": [
+                  [
+                    {
+                      "node": "Discord - Critical Alert",
+                      "type": "main",
+                      "index": 0
+                    }
+                  ]
+                ]
+              }
+            },
+            "pinData": {}
+          }
+          {% endraw %}
+
+    # -------------------------------
+    # DELETE EXISTING WORKFLOWS FIRST
+    # -------------------------------
+
+    - name: "[N8N] Ensure API key is set"
+      fail:
+        msg: "❌ Variable 'n8n_api_key' is empty! Please set it in vars or via environment before running the playbook. This task is failing on purpose to prevent proceeding without the API key. Go get it from your n8n instance in the UI under Settings > API Key."
+      when: n8n_api_key is not defined or n8n_api_key | trim == ""
+
+    - name: "[N8N] Get all workflow IDs"
+      command: podman exec {{ n8n_container_name }} n8n list:workflow --onlyId
+      register: n8n_workflows
+      changed_when: false
+
+    - name: "[N8N] Delete workflows via Public API"
+      uri:
+        url: "{{ n8n_host }}:{{ n8n_port }}/api/v1/workflows/{{ item }}"
+        method: DELETE
+        headers:
+          X-N8N-API-KEY: "{{ n8n_api_key }}"
+          accept: "application/json"
+        status_code: [200, 404]
+      loop: "{{ n8n_workflows.stdout_lines }}"
+      when: n8n_workflows.stdout_lines | length > 0
+      register: deleted_workflows
+
+    - name: "[N8N] Show deleted workflow IDs"
+      debug:
+        var: deleted_workflows.results | map(attribute='item') | list
+      when: deleted_workflows is defined
+    # -------------------------------
+    # IMPORT WORKFLOWS INTO N8N
+    # -------------------------------
+    - name: "[N8N] Import AI Security Automation workflow into n8n"
+      command: podman exec {{ n8n_container_name }} n8n import:workflow --input="/workflows/ai-security-automation.json" --override
+      register: workflow_import
+
+    - name: "[N8N] Display workflow import result"
+      debug:
+        msg: "{{ workflow_import.stdout }}"
+      when: workflow_import.stdout is defined
+
+    # -------------------------------
+    # ACTIVATE IMPORTED WORKFLOW
+    # -------------------------------
+    - name: "[N8N] Get workflow ID"
+      command: podman exec {{ n8n_container_name }} n8n list:workflow --onlyId
+      register: workflow_list
+
+    - name: "[N8N] Extract workflow ID"
+      set_fact:
+        imported_workflow_id: "{{ workflow_list.stdout_lines[0] | trim }}"
+
+    - name: "[N8N] Activate imported workflow"
+      command: >
+        podman exec {{ n8n_container_name }}
+        n8n update:workflow --id={{ imported_workflow_id }} --active=true
+      register: workflow_activation
+
+    - name: "[N8N] Show activation result"
+      debug:
+        msg: "{{ workflow_activation.stdout }}"
+
+    # -------------------------------
+    # RESTART N8N CONTAINER & VERIFY IT'S BACK ONLINE
+    # -------------------------------
+    - name: "[N8N] Restart container to apply workflow activation"
+      command: podman restart {{ n8n_container_name }}
+      register: n8n_restart
+      changed_when: "'Restarting' in n8n_restart.stdout or 'restarted' in n8n_restart.stdout"
+
+    - name: "[N8N] Wait for n8n service to come back online"
+      uri:
+        url: "{{ n8n_host }}:{{ n8n_port }}"
+        method: GET
+        return_content: no
+        status_code: 200
+        timeout: 10
+        user: '{{ n8n_user | regex_replace(''^"|",'', '''') }}'
+        password: '{{ n8n_pass | regex_replace(''^"|",'', '''') }}'
+        force_basic_auth: true
+      register: n8n_recheck
+      retries: 30
+      delay: 10
+      until: n8n_recheck.status == 200
+
+    - name: "[N8N] Confirm n8n is fully operational"
+      debug:
+        msg: "✅ n8n service restarted successfully and is responsive."
+
+    - name: "[N8N] Final status"
+      debug:
+        msg: >
+          🚀 n8n deployment complete.
+          Access it at {{ n8n_host }}:{{ n8n_port }}
+          Username: {{ n8n_user | regex_replace('^"|"$', '') }}
+          Workflow ID: {{ imported_workflow_id }}

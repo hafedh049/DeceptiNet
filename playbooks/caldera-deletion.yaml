@@ -1,33 +1,244 @@
 ---
-- name: Uninstall MITRE CALDERA
-  hosts: Red-Blue
+# Complete Caldera Server + Agent Destruction Playbook (Podman RHEL 10)
+- name: Complete Caldera Infrastructure Teardown
+  hosts: Red, T-Pot
+  become: true
   gather_facts: false
   vars:
-    caldera_dir: /opt/caldera
+    caldera_dir: "{{ CALDERA_DIR }}"
+    caldera_container_name: "{{ CALDERA_CONTAINER_NAME }}"
+    caldera_image: "{{ CALDERA_IMAGE }}"
 
   tasks:
-    - name: Stop CALDERA service if running
+    # =================================
+    # T-Pot AGENT DESTRUCTION
+    # =================================
+    - name: Stop Caldera agent service
+      when: inventory_hostname == "T-Pot"
       systemd:
-        name: caldera
+        name: caldera-agent.service
         state: stopped
+      ignore_errors: true
+
+    - name: Disable Caldera agent service
+      when: inventory_hostname == "T-Pot"
+      systemd:
+        name: caldera-agent.service
         enabled: no
       ignore_errors: true
 
-    - name: Disable and remove CALDERA systemd service
+    - name: Remove systemd service file
+      when: inventory_hostname == "T-Pot"
       file:
-        path: /etc/systemd/system/caldera.service
+        path: /etc/systemd/system/caldera-agent.service
         state: absent
 
-    - name: Reload systemd after removing service
-      systemd:
-        daemon_reload: yes
-        daemon_reexec: yes
+    - name: Remove agent Python script
+      when: inventory_hostname == "T-Pot"
+      file:
+        path: /usr/local/bin/caldera_agent.py
+        state: absent
 
-    - name: Kill any stray CALDERA processes
-      shell: "pkill -f '{{ caldera_dir }}/server.py'"
+    - name: Remove PAW storage directory
+      when: inventory_hostname == "T-Pot"
+      file:
+        path: /etc/caldera
+        state: absent
+
+    - name: Remove Python packages installed by Caldera
+      when: inventory_hostname == "T-Pot"
+      pip:
+        name:
+          - requests
+          - netifaces
+        executable: pip3
+        state: absent
       ignore_errors: true
 
-    - name: Remove CALDERA directory
+    - name: Reload systemd after cleanup
+      when: inventory_hostname == "T-Pot"
+      systemd:
+        daemon_reload: true
+
+    - name: Kill any remaining Caldera agent processes
+      when: inventory_hostname == "T-Pot"
+      shell: |
+        pkill -f "caldera_agent.py" || true
+        pkill -f "python3.*caldera" || true
+      args:
+        warn: false
+
+    # =================================
+    # CALDERA SERVER DESTRUCTION (Podman)
+    # =================================
+    - name: Stop Caldera container
+      when: inventory_hostname == "Caldera"
+      shell: |
+        podman stop {{ caldera_container_name }} || true
+      args:
+        warn: false
+
+    - name: Remove Caldera container
+      when: inventory_hostname == "Caldera"
+      shell: |
+        podman rm {{ caldera_container_name }} || true
+      args:
+        warn: false
+
+    - name: Remove Caldera Podman image
+      when: inventory_hostname == "Caldera"
+      shell: |
+        podman rmi {{ caldera_image }} || true
+      args:
+        warn: false
+
+    - name: Remove Caldera directory and all contents
+      when: inventory_hostname == "Caldera"
       file:
         path: "{{ caldera_dir }}"
         state: absent
+
+    - name: Remove Podman Compose file (if using podman-compose)
+      when: inventory_hostname == "Caldera"
+      file:
+        path: "{{ caldera_dir }}/docker-compose.yml"
+        state: absent
+
+    - name: Remove any Caldera-related Podman networks
+      when: inventory_hostname == "Caldera"
+      shell: |
+        podman network ls --format "{{'{{.Name}}'}}" | grep caldera | xargs -r podman network rm || true
+      args:
+        warn: false
+
+    - name: Remove any Caldera-related Podman volumes
+      when: inventory_hostname == "Caldera"
+      shell: |
+        podman volume ls --format "{{'{{.Name}}'}}" | grep caldera | xargs -r podman volume rm || true
+      args:
+        warn: false
+
+    - name: Clean up temporary files
+      when: inventory_hostname == "Caldera"
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/abilities.json"
+        - "/tmp/caldera_operation_results.json"
+        - "/tmp/caldera_backup.tar.gz"
+        - "{{ caldera_dir }}/local.yml"
+        - "{{ caldera_dir }}/patched_local.yml"
+        - "{{ caldera_dir }}/secrets.json"
+
+    - name: Kill any remaining Caldera processes
+      when: inventory_hostname == "Caldera"
+      shell: |
+        pkill -f "caldera" || true
+        pkill -f "{{ caldera_container_name }}" || true
+        pkill -f "podman.*caldera" || true
+      args:
+        warn: false
+
+    # =================================
+    # PODMAN SYSTEM CLEANUP (Optional)
+    # =================================
+    - name: Clean up unused Podman containers
+      when: inventory_hostname == "Caldera"
+      shell: podman container prune -f
+      args:
+        warn: false
+
+    - name: Clean up unused Podman networks
+      when: inventory_hostname == "Caldera"
+      shell: podman network prune -f
+      args:
+        warn: false
+
+    - name: Clean up unused Podman images
+      when: inventory_hostname == "Caldera"
+      shell: podman image prune -f
+      args:
+        warn: false
+
+    # =================================
+    # VERIFICATION CHECKS
+    # =================================
+    - name: Verify Caldera container is gone
+      when: inventory_hostname == "Caldera"
+      shell: |
+        if podman ps -a --format "{{'{{.Names}}'}}" | grep -q "{{ caldera_container_name }}"; then
+          echo "FAILED: Caldera container still exists"
+          exit 1
+        else
+          echo "SUCCESS: Caldera container removed"
+        fi
+      register: container_verify
+      changed_when: false
+      failed_when: container_verify.rc != 0
+
+    - name: Verify agent files are removed from T-Pot
+      when: inventory_hostname == "T-Pot"
+      stat:
+        path: "{{ item }}"
+      loop:
+        - /etc/systemd/system/caldera-agent.service
+        - /usr/local/bin/caldera_agent.py
+        - /etc/caldera
+      register: agent_files_check
+
+    - name: Verify agent service is gone
+      when: inventory_hostname == "T-Pot"
+      shell: |
+        if systemctl is-active caldera-agent.service 2>/dev/null; then
+          echo "FAILED: Agent service still active"
+          exit 1
+        else
+          echo "SUCCESS: Agent service removed"
+        fi
+      register: service_verify
+      changed_when: false
+      failed_when: service_verify.rc != 0
+
+    - name: Verify no Caldera processes running
+      when: inventory_hostname == "T-Pot"
+      shell: |
+        if pgrep -f "caldera_agent.py" >/dev/null; then
+          echo "FAILED: Caldera processes still running"
+          exit 1
+        else
+          echo "SUCCESS: No Caldera processes running"
+        fi
+      register: process_verify
+      changed_when: false
+      failed_when: process_verify.rc != 0
+
+    # =================================
+    # FINAL CLEANUP REPORT
+    # =================================
+    - name: Generate cleanup report
+      debug:
+        msg: |
+          🗑️ CALDERA CLEANUP COMPLETED 🗑️
+
+          {% if inventory_hostname == "Caldera" %}
+          SERVER CLEANUP:
+          - Container: {{ caldera_container_name }} - REMOVED ✅
+          - Directory: {{ caldera_dir }} - REMOVED ✅
+          - Podman image: {{ caldera_image }} - REMOVED ✅
+
+          {% elif inventory_hostname == "T-Pot" %}
+          AGENT CLEANUP:
+          - Service: caldera-agent.service - REMOVED ✅
+          - Script: /usr/local/bin/caldera_agent.py - REMOVED ✅
+          - PAW storage: /etc/caldera - REMOVED ✅
+          - Processes: KILLED ✅
+          {% endif %}
+
+    - name: Final system daemon reload
+      systemd:
+        daemon_reload: true
+
+    - name: Cleanup completion message
+      debug:
+        msg: "🎉 CALDERA INFRASTRUCTURE COMPLETELY DESTROYED on {{ inventory_hostname }} 🎉"

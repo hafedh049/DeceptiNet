@@ -1,0 +1,121 @@
+- name: Build and push SecureUploader Podman images
+  hosts: PAM-WK-1, PAM-WK-2
+  become: true
+  vars:
+    ghcr_user: "{{ GHCR_USERNAME }}"
+    ghcr_repo: "{{ GHCR_REPO }}"
+    ghcr_token: "{{ GHCR_TOKEN }}"
+    frontend_image: "{{ K8S_FRONTEND_DEPLOYMENT }}"
+  tasks:
+    - name: Install Podman and pip
+      package:
+        name:
+          - python3-pip
+          - podman
+          - podman-docker
+        state: present
+
+    - name: Log in to GitHub Container Registry
+      shell: |
+        echo "{{ ghcr_token }}" | podman login ghcr.io -u {{ ghcr_user }} --password-stdin
+
+    - name: Delete all local Podman images
+      shell: |
+        podman rmi -a -f || true
+
+    - name: Delete existing frontend image from GHCR
+      shell: |
+        curl -sL -X DELETE \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer {{ ghcr_token }}" \
+          "https://api.github.com/user/packages/container/{{ frontend_image }}" || true
+      failed_when: false
+
+    - name: Build and push web application frontend image with Podman
+      shell: |
+        podman build -t "ghcr.io/{{ ghcr_user }}/{{ frontend_image }}:latest" ../{{ frontend_image }}/
+        podman push "ghcr.io/{{ ghcr_user }}/{{ frontend_image }}:latest"
+
+- name: Deploy Web Application manifests to k3s
+  hosts: CP1
+  gather_facts: false
+  become: true
+
+  vars:
+    remote_manifest_dir: /root/manifests
+    k8s_namespace: "{{ K8S_NAMESPACE }}"
+    ghcr_username: "{{ GHCR_USERNAME }}"
+    ghcr_token: "{{ GHCR_TOKEN }}"
+    ghcr_secret_name: ghcr-pull-secret
+    frontend_image: "{{ K8S_FRONTEND_IMAGE }}"
+
+  tasks:
+    - name: Create the remote manifests folder
+      file:
+        path: "{{ remote_manifest_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Copy all manifests to nodes
+      copy:
+        src: /root/manifests/
+        dest: "{{ remote_manifest_dir }}/"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Ensure Kubernetes namespace exists
+      shell: |
+        KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+        /usr/local/bin/kubectl get ns "{{ k8s_namespace }}" >/dev/null 2>&1 || \
+        /usr/local/bin/kubectl create ns "{{ k8s_namespace }}"
+      args:
+        executable: /bin/bash
+
+    - name: Check if GHCR pull secret already exists
+      shell: |
+        KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+        /usr/local/bin/kubectl get secret "{{ ghcr_secret_name }}" -n "{{ k8s_namespace }}" --ignore-not-found
+      register: ghcr_secret_check
+      args:
+        executable: /bin/bash
+
+    - name: Create GHCR pull secret if missing
+      shell: |
+        KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+        /usr/local/bin/kubectl create secret docker-registry "{{ ghcr_secret_name }}" \
+          --docker-server=ghcr.io \
+          --docker-username="{{ ghcr_username }}" \
+          --docker-password="{{ ghcr_token }}" \
+          --namespace="{{ k8s_namespace }}"
+      when: ghcr_secret_check.stdout == ""
+      args:
+        executable: /bin/bash
+
+    - name: Patch default service account with GHCR pull secret
+      shell: |
+        KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+        /usr/local/bin/kubectl patch serviceaccount default -n "{{ k8s_namespace }}" \
+          -p '{"imagePullSecrets": [{"name": "{{ ghcr_secret_name }}"}]}' || true
+      args:
+        executable: /bin/bash
+
+    - name: Delete Web Application frontend image locally
+      shell: crictl rmi {{ frontend_image }} || true
+
+    - name: Delete existing Kubernetes resources
+      shell: |
+        KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+        /usr/local/bin/kubectl delete -f "{{ remote_manifest_dir }}" --recursive --ignore-not-found
+      args:
+        chdir: "{{ remote_manifest_dir }}"
+        executable: /bin/bash
+      failed_when: false
+
+    - name: Apply all Kubernetes manifests
+      shell: |
+        KUBECONFIG="/etc/rancher/k3s/k3s.yaml"
+        /usr/local/bin/kubectl apply -f "{{ remote_manifest_dir }}" --recursive
+      args:
+        chdir: "{{ remote_manifest_dir }}"
+        executable: /bin/bash
