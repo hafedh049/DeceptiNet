@@ -1,82 +1,92 @@
 ---
-- name: Uninstall k3s Kubernetes Cluster
+- name: Deploy k3s Kubernetes Cluster
   hosts: PAM-WK-1, PAM-WK-2
-  become: true
   vars:
     k3s_user: "root"
 
   tasks:
     # ============================================================
-    # Stop and disable service
+    # k3s Installation
     # ============================================================
-    - name: "[K3S] Stop and disable k3s service if running"
+    - name: "[K3S] Ensure k3s_user is defined"
+      assert:
+        that: k3s_user is defined
+        fail_msg: "K3S_USER must be defined (e.g., 'ubuntu', 'root', 'ansible')."
+
+    - name: "[K3S] Download and install k3s"
+      shell: |
+        curl -sfL https://get.k3s.io | sh -
+      args:
+        creates: /usr/local/bin/k3s
+      register: k3s_install
+      changed_when: "'already installed' not in k3s_install.stdout"
+
+    - name: "[K3S] Ensure k3s service is enabled and running"
       systemd:
         name: k3s
-        state: stopped
-        enabled: false
-      ignore_errors: true
+        state: started
+        enabled: true
+        daemon_reload: yes
 
-    # ============================================================
-    # Run k3s uninstall script (clean removal)
-    # ============================================================
-    - name: "[K3S] Run official uninstall script if available"
+    - name: "[K3S] Wait for k3s control plane to be ready"
       shell: |
-        if [ -f /usr/local/bin/k3s-uninstall.sh ]; then
-          /usr/local/bin/k3s-uninstall.sh
-        fi
-      args:
-        executable: /bin/bash
-      ignore_errors: true
+        /usr/local/bin/kubectl get nodes --no-headers | grep -q "Ready"
+      register: k3s_ready
+      retries: 30
+      delay: 10
+      until: k3s_ready.rc == 0
+      become: true
 
-    # ============================================================
-    # Remove leftover files and dirs
-    # ============================================================
-    - name: "[K3S] Remove residual files and directories"
-      file:
-        path: "{{ item }}"
-        state: absent
-      loop:
-        - /usr/local/bin/k3s
-        - /usr/local/bin/k3s-uninstall.sh
-        - /etc/systemd/system/k3s.service
-        - /etc/rancher/k3s
-        - /var/lib/rancher
-        - /var/lib/kubelet
-        - /var/lib/cni
-        - /run/k3s
-      ignore_errors: true
-
-    # ============================================================
-    # Remove user kubeconfig
-    # ============================================================
-    - name: "[K3S] Remove kubeconfig for non-root user"
+    - name: "[K3S] Ensure ~/.kube directory exists for {{ k3s_user }}"
       file:
         path: "/home/{{ k3s_user }}/.kube"
-        state: absent
+        state: directory
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0700"
       when: k3s_user != "root"
-      ignore_errors: true
 
-    - name: "[K3S] Remove kubeconfig for root"
+    - name: "[K3S] Ensure ~/.kube directory exists for root"
       file:
         path: "/root/.kube"
-        state: absent
+        state: directory
+        mode: "0700"
       when: k3s_user == "root"
-      ignore_errors: true
 
-    # ============================================================
-    # Clean bash alias
-    # ============================================================
-    - name: "[K3S] Remove alias for kubectl (k)"
-      lineinfile:
-        path: "{{ (k3s_user == 'root') | ternary('/root/.bashrc', '/home/' + k3s_user + '/.bashrc') }}"
-        regexp: "^alias k='kubectl'"
-        state: absent
-      ignore_errors: true
+    - name: "[K3S] Copy kubeconfig to user's home"
+      copy:
+        src: /etc/rancher/k3s/k3s.yaml
+        dest: "{{ (k3s_user == 'root') | ternary('/root/.kube/config', '/home/' + k3s_user + '/.kube/config') }}"
+        owner: "{{ k3s_user }}"
+        group: "{{ k3s_user }}"
+        mode: "0600"
+        remote_src: yes
 
-    - name: "[K3S] Confirm deletion complete"
+    - name: "[K3S] Replace localhost with 127.0.0.1 in kubeconfig (for remote kubectl)"
+      replace:
+        path: "{{ (k3s_user == 'root') | ternary('/root/.kube/config', '/home/' + k3s_user + '/.kube/config') }}"
+        regexp: "127.0.0.1"
+        replace: "127.0.0.1"
+      # Optional: if you plan to access the cluster remotely, you may want to replace "localhost" with the node's IP
+      # But for local use, 127.0.0.1 is fine.
+
+    - name: "[K3S] Deployment complete"
       debug:
         msg: |
-          🧹 k3s and all its components have been successfully removed.
-          - Service: stopped and disabled
-          - Binaries and configs: purged
-          - User kubeconfig and aliases: cleaned up
+          ✅ k3s is installed and ready!
+          - User '{{ k3s_user }}' can now run: kubectl get nodes
+          - Kubeconfig: {{ (k3s_user == 'root') | ternary('/root/.kube/config', '/home/' + k3s_user + '/.kube/config') }}
+
+    - name: "[K3S] Create permanent alias for kubectl (k)"
+      lineinfile:
+        path: "{{ (k3s_user == 'root') | ternary('/root/.bashrc', '/home/' + k3s_user + '/.bashrc') }}"
+        line: "alias k='kubectl'"
+        create: yes
+        state: present
+
+    - name: "[K3S] Reload bashrc for alias availability"
+      shell: |
+        source {{ (k3s_user == 'root') | ternary('/root/.bashrc', '/home/' + k3s_user + '/.bashrc') }}
+      args:
+        executable: /bin/bash
+      changed_when: false

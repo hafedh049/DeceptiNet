@@ -24,23 +24,27 @@
 
   tasks:
     - name: Install Podman and dependencies
-      dnf:
+      package:
         name:
           - podman
-          - podman-compose
+          - podman-docker
           - python3-pip
         state: present
+
+    - name: Install Compose with pip
+      pip:
+        name: podman-compose
+        executable: pip3
 
     - name: Install setuptools
       pip:
         name: setuptools
-        extra_args: --break-system-packages
 
     - name: Ensure logging directories exist
       file:
         path: "{{ item }}"
         state: directory
-        mode: "0755"
+        mode: "0777"
       loop:
         - /opt/logging
         - /opt/logging/loki/chunks
@@ -148,13 +152,13 @@
                 - "{{ loki_port }}:{{ loki_port }}"
               command: -config.file=/etc/loki/local-config.yaml -config.expand-env=true
               volumes:
-                - /opt/logging/loki-config.yaml:/etc/loki/local-config.yaml
-                - /opt/logging/loki/chunks:/loki/chunks
-                - /opt/logging/loki/index:/loki/index
-                - /opt/logging/loki/cache:/loki/cache
-                - /opt/logging/loki/wal:/loki/wal
-                - /opt/logging/loki/compactor:/loki/compactor
-                - /opt/logging/rules:/loki/rules
+                - /opt/logging/loki-config.yaml:/etc/loki/local-config.yaml:Z
+                - /opt/logging/loki/chunks:/loki/chunks:Z
+                - /opt/logging/loki/index:/loki/index:Z
+                - /opt/logging/loki/cache:/loki/cache:Z
+                - /opt/logging/loki/wal:/loki/wal:Z
+                - /opt/logging/loki/compactor:/loki/compactor:Z
+                - /opt/logging/rules:/loki/rules:Z
 
             grafana:
               image: "{{ grafana_image }}"
@@ -167,8 +171,8 @@
               depends_on:
                 - loki
               volumes:
-                - grafana-data:/var/lib/grafana
-                - /opt/logging/provisioning:/etc/grafana/provisioning
+                - grafana-data:/var/lib/grafana:Z
+                - /opt/logging/provisioning:/etc/grafana/provisioning:Z
 
             alertmanager:
               image: "{{ alertmanager_image }}"
@@ -176,7 +180,7 @@
               ports:
                 - "{{ alertmanager_port }}:9093"
               volumes:
-                - /opt/logging/alertmanager/config.yml:/etc/alertmanager/config.yml
+                - /opt/logging/alertmanager/config.yml:/etc/alertmanager/config.yml:Z
 
           volumes:
             grafana-data:
@@ -195,8 +199,8 @@
           Type=oneshot
           RemainAfterExit=true
           WorkingDirectory=/opt/logging
-          ExecStart=/usr/bin/podman-compose -f /opt/logging/podman-compose.yml up -d
-          ExecStop=/usr/bin/podman-compose -f /opt/logging/podman-compose.yml down
+          ExecStart= /usr/local/bin/podman-compose -f /opt/logging/podman-compose.yml up -d
+          ExecStop= /usr/local/bin/podman-compose -f /opt/logging/podman-compose.yml down
           TimeoutStartSec=0
 
           [Install]
@@ -222,7 +226,6 @@
       retries: 30
       delay: 10
       until: grafana_health.status == 200
-      ignore_errors: true
 
     - name: Deployment complete
       debug:
@@ -402,9 +405,9 @@
               honeypot: "cowrie"
               response: "rapid"
             annotations:
-              summary: "Rapid SSH brute force from {{ '{{' ~ '\\$labels.src_ip' ~ '}}' }}"
+              summary: "Rapid SSH brute force from {{ '$labels.src_ip' }}"
               description: |
-                More than 5 SSH attempts from {{ '{{' ~ '\\$labels.src_ip' ~ '}}' }} in the last minute on T-Pot (Cowrie) — rapid detection.
+                More than 5 SSH attempts from {{ '$labels.src_ip' }} in the last minute on T-Pot (Cowrie) — rapid detection.
 
           - title: "Dionaea FTP Brute Force"
             folderUID: "{{ folderUID }}"
@@ -451,8 +454,8 @@
               honeypot: "dionaea"
               response: "rapid"
             annotations:
-              summary: "Rapid FTP brute force from {{'{{ $labels.src_ip }}'}}"
-              description: "More than 5 failed FTP login attempts from {{'{{ $labels.src_ip }}'}} in the last 5 minutes on T-Pot Dionaea honeypot."
+              summary: "Rapid FTP brute force from {{ '$labels.src_ip' }}"
+              description: "More than 5 failed FTP login attempts from {{ '$labels.src_ip' }} in the last 5 minutes on T-Pot Dionaea honeypot."
 
           - title: "Suricata HTTP Anomaly - Rapid"
             folderUID: "{{ folderUID }}"
@@ -499,8 +502,8 @@
               honeypot: "suricata"
               response: "rapid"
             annotations:
-              summary: "Rapid HTTP anomaly from {{'{{ $labels.src_ip }}'}}"
-              description: "More than 10 anomalous HTTP requests from {{'{{ $labels.src_ip }}'}} in the last 30s on T-Pot (Suricata) honeypot."
+              summary: "Rapid HTTP anomaly from {{ '$labels.src_ip' }}"
+              description: "More than 10 anomalous HTTP requests from {{ '$labels.src_ip' }} in the last 30s on T-Pot (Suricata) honeypot."
 
           - title: "Nginx High Request Rate - Rapid"
             folderUID: "{{ folderUID }}"
@@ -547,8 +550,8 @@
               honeypot: "nginx"
               response: "rapid"
             annotations:
-              summary: "Rapid Nginx request rate from {{'{{ $labels.src_ip }}'}}"
-              description: "More than 10 HTTP requests from {{'{{ $labels.src_ip }}'}} in the last 30s to Nginx endpoints (Kibana/websocket) on T-Pot."
+              summary: "Rapid Nginx request rate from {{ '$labels.src_ip' }}"
+              description: "More than 10 HTTP requests from {{ '$labels.src_ip' }} in the last 30s to Nginx endpoints (Kibana/websocket) on T-Pot."
 
           - title: "h0neytr4p HTTP Flood / Probing - Rapid"
             folderUID: "{{ folderUID }}"
@@ -596,8 +599,8 @@
               honeypot: "h0neytr4p"
               response: "rapid"
             annotations:
-              summary: "High POST activity from {{'{{ $labels.src_ip }}'}} to h0neytr4p"
-              description: "Detected >8 POST requests from {{'{{ $labels.src_ip }}'}} in 30s (random POST paths / probing). Tune threshold/interval if noisy."
+              summary: "High POST activity from {{ '$labels.src_ip' }} to h0neytr4p"
+              description: "Detected >8 POST requests from {{ '$labels.src_ip' }} in 30s (random POST paths / probing). Tune threshold/interval if noisy."
 
     - name: Create alert rules from alerts_list
       uri:

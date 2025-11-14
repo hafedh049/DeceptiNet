@@ -30,7 +30,7 @@
         "state": "start"
     },
     {
-        "name": "PAM-WN-2",
+        "name": "PAM-WK-2",
         "path": "D:/Virtual Machines/PAM-WN-2/PAM-WN-2.vmx",
         "ip": "192.168.3.140",
         "state": "start"

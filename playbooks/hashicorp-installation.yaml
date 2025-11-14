@@ -3,56 +3,83 @@
   hosts: HashiCorp
   become: true
   vars:
-    vault_container_name: vault-dev
-    boundary_container_name: boundary-dev
-    db_container_name: boundary-db
-    vault_port: 8200
-    boundary_port: 9200
-    db_port: 5432
-    vault_data_dir: /opt/vault/data
-    boundary_data_dir: /opt/boundary/data
-    podman_bin: /usr/bin/podman
-    vault_token: root
-    boundary_db_user: boundary
-    boundary_db_pass: boundarypass
-    boundary_db_name: boundary
+    vault_container_image: "{{ VAULT_CONTAINER_IMAGE }}"
+    boundary_container_image: "{{ BOUNDARY_CONTAINER_IMAGE }}"
+    db_container_image: "{{ DB_CONTAINER_IMAGE }}"
+    vault_container_name: "{{ VAULT_CONTAINER_NAME }}"
+    boundary_container_name: "{{ BOUNDARY_CONTAINER_NAME }}"
+    db_container_name: "{{ DB_CONTAINER_NAME }}"
+    vault_port: "{{ VAULT_PORT }}"
+    boundary_port: "{{ BOUNDARY_PORT }}"
+    db_port: "{{ DB_PORT }}"
+    vault_data_dir: "{{ VAULT_DATA_DIR }}"
+    boundary_data_dir: "{{ BOUNDARY_DATA_DIR }}"
+    boundary_db_dir: "{{ BOUNDARY_DB_DIR }}"
+    vault_token: "{{ VAULT_TOKEN }}"
+    boundary_db_user: "{{ BOUNDARY_DB_USER }}"
+    boundary_db_pass: "{{ BOUNDARY_DB_PASS }}"
+    boundary_db_name: "{{ BOUNDARY_DB_NAME }}"
+    hashicorp_ip: "{{ ansible_default_ipv4.address }}"
+    boundary_vault_transit_key: "{{ BOUNDARY_VAULT_TRANSIT_KEY }}"
 
   tasks:
     - name: Ensure required packages
-      dnf:
+      package:
         name:
           - podman
+          - podman-docker
           - jq
           - curl
           - unzip
+          - python3-pip
         state: present
+
+    - name: Install Compose with pip
+      pip:
+        name: podman-compose
+        executable: pip3
+
+    - name: Remove existing PostgreSQL data directory (reset DB)
+      file:
+        path: "{{ boundary_db_dir }}"
+        state: absent
 
     - name: Ensure data directories exist
       file:
         path: "{{ item }}"
         state: directory
-        mode: "0755"
+        mode: "0777"
       loop:
         - "{{ vault_data_dir }}"
         - "{{ boundary_data_dir }}"
+        - "{{ boundary_db_dir }}"
 
     - name: Pull required container images
-      command: "{{ podman_bin }} pull {{ item }}"
+      command: "podman pull {{ item }}"
       loop:
-        - hashicorp/vault:latest
-        - hashicorp/boundary:latest
-        - postgres:16
+        - "{{ vault_container_image }}"
+        - "{{ boundary_container_image }}"
+        - "{{ db_container_image }}"
+
+    - name: Delete required containers
+      command: "podman rm -f {{ item }}"
+      loop:
+        - "{{ vault_container_name }}"
+        - "{{ boundary_container_name }}"
+        - "{{ db_container_name }}"
+      failed_when: false
 
     - name: Start PostgreSQL for Boundary
       command: >
-        {{ podman_bin }} run -d --name {{ db_container_name }}
+        podman run -d --name {{ db_container_name }}
         -e POSTGRES_USER={{ boundary_db_user }}
         -e POSTGRES_PASSWORD={{ boundary_db_pass }}
         -e POSTGRES_DB={{ boundary_db_name }}
-        -p {{ db_port }}:5432
-        -v /opt/boundary/db:/var/lib/postgresql/data
+        -u 0:0
+        -p {{ db_port }}:{{ db_port }}
+        -v /opt/boundary/db:/var/lib/postgresql/data:rw,Z
         --network host
-        postgres:16
+        {{ db_container_image }}
 
     - name: Wait for PostgreSQL to be ready
       wait_for:
@@ -60,14 +87,19 @@
         delay: 5
         timeout: 60
 
-    - name: Start Vault container
+    - name: Start Vault container (dev mode)
       command: >
-        {{ podman_bin }} run -d --name {{ vault_container_name }}
-        -p {{ vault_port }}:8200
-        -v {{ vault_data_dir }}:/vault/file
-        -e 'VAULT_DEV_ROOT_TOKEN_ID={{ vault_token }}'
+        podman run -d --name {{ vault_container_name }}
+        --cap-add=IPC_LOCK
+        -u 0:0
+        -v {{ vault_data_dir }}:/vault/file:rw,Z
         --network host
-        hashicorp/vault:latest server
+        -e VAULT_ADDR=http://{{ hashicorp_ip }}:{{ vault_port }}
+        -e VAULT_TOKEN={{ vault_token }}
+        {{ vault_container_image }} server
+        -dev
+        -dev-listen-address=0.0.0.0:{{ vault_port }}
+        -dev-root-token-id={{ vault_token }}
 
     - name: Wait for Vault API
       wait_for:
@@ -77,39 +109,133 @@
 
     - name: Enable Vault transit engine
       command: >
-        {{ podman_bin }} exec {{ vault_container_name }}
+        podman exec {{ vault_container_name }}
         vault secrets enable transit
-      environment:
-        VAULT_ADDR: "http://127.0.0.1:{{ vault_port }}"
-        VAULT_TOKEN: "{{ vault_token }}"
-      ignore_errors: true
 
     - name: Create Boundary transit key
       command: >
-        {{ podman_bin }} exec {{ vault_container_name }}
-        vault write -f transit/keys/boundary_root
-      environment:
-        VAULT_ADDR: "http://127.0.0.1:{{ vault_port }}"
-        VAULT_TOKEN: "{{ vault_token }}"
-      ignore_errors: true
+        podman exec {{ vault_container_name }}
+        vault write -f transit/keys/{{ boundary_vault_transit_key }}
 
-    - name: Start Boundary container
+    - name: "[Boundary] Create Boundary config file"
+      copy:
+        dest: "{{ boundary_data_dir }}/config.hcl"
+        content: |
+          # Disable memory from being swapped
+          disable_mlock = true
+
+          # API listener
+          listener "tcp" {
+            address = "0.0.0.0:9200"
+            purpose = "api"
+            tls_disable = true
+          }
+
+          # Cluster listener
+          listener "tcp" {
+            address = "0.0.0.0:9201"
+            purpose = "cluster"
+          }
+
+          # Ops listener
+          listener "tcp" {
+            address = "0.0.0.0:9202"
+            purpose = "ops"
+            tls_disable = true
+          }
+
+          # Controller configuration
+          controller {
+            name        = "boundary-controller"
+            description = "Boundary controller using Vault transit"
+            public_cluster_addr = "0.0.0.0:9201"
+
+            database {
+              url = "postgresql://{{ boundary_db_user }}:{{ boundary_db_pass }}@{{ hashicorp_ip }}:{{ db_port }}/{{ boundary_db_name }}"
+            }
+
+            dev_license = "accept"
+          }
+
+          # Root KMS using Vault transit
+          kms "transit" {
+            purpose  = "root"
+            address  = "http://{{ hashicorp_ip }}:{{ vault_port }}"
+            token    = "{{ vault_token }}"
+            key_name = "{{ boundary_vault_transit_key }}"
+            disable_renewal = "false"
+            mount_path = "transit/"
+            namespace  = ""
+            tls_skip_verify = "true"
+          }
+
+          # Event logging
+          events {
+            audit_enabled       = true
+            sysevents_enabled   = true
+            observations_enable = true
+
+            sink "stderr" {
+              name        = "all-events"
+              description = "All events sent to stderr"
+              event_types = ["*"]
+              format      = "cloudevents-json"
+            }
+
+            sink {
+              name        = "file-sink"
+              description = "All events sent to a file"
+              event_types = ["*"]
+              format      = "cloudevents-json"
+              file {
+                path      = "/var/log/boundary"
+                file_name = "controller.log"
+              }
+              audit_config {
+                audit_filter_overrides {
+                  sensitive = "redact"
+                  secret    = "redact"
+                }
+              }
+            }
+          }
+
+    - name: "[Boundary] Start Boundary container with DB init"
       command: >
-        {{ podman_bin }} run -d --name {{ boundary_container_name }}
-        -p {{ boundary_port }}:9200
-        -v {{ boundary_data_dir }}:/boundary/data
-        -e 'BOUNDARY_DATABASE_URL=postgresql://{{ boundary_db_user }}:{{ boundary_db_pass }}@127.0.0.1:{{ db_port }}/{{ boundary_db_name }}'
-        -e 'BOUNDARY_VAULT_ADDR=http://127.0.0.1:{{ vault_port }}'
+        podman run -d --name {{ boundary_container_name }}
+        --cap-add IPC_LOCK
+        -p {{ boundary_port }}:{{ boundary_port }}
+        -v {{ boundary_data_dir }}/config.hcl:/boundary/config.hcl:ro,Z
+        -e 'BOUNDARY_DATABASE_URL=postgresql://{{ boundary_db_user }}:{{ boundary_db_pass }}@{{ hashicorp_ip }}:{{ db_port }}/{{ boundary_db_name }}'
+        -e 'BOUNDARY_VAULT_ADDR=http://{{ hashicorp_ip }}:{{ vault_port }}'
         -e 'BOUNDARY_VAULT_TOKEN={{ vault_token }}'
-        -e 'BOUNDARY_VAULT_TRANSIT_KEY=boundary_root'
+        -e 'BOUNDARY_VAULT_TRANSIT_KEY={{ boundary_vault_transit_key }}'
         -e 'BOUNDARY_DEV_LICENSE=accept'
+        -e 'BOUNDARY_LISTEN_ADDR=0.0.0.0:{{ boundary_port }}'
+        -u 0:0
         --network host
-        hashicorp/boundary:latest server -config=/boundary/data
+        {{ boundary_container_image }}
+        sh -c "boundary database init -config=/boundary/config.hcl && boundary server -config=/boundary/config.hcl"
+
+    - name: Open Vault, Boundary, and PostgreSQL ports in firewall
+      ansible.builtin.firewalld:
+        port: "{{ item }}"
+        permanent: true
+        state: enabled
+        immediate: yes
+      loop:
+        - "{{ vault_port }}/tcp"
+        - "{{ boundary_port }}/tcp"
+        - "{{ db_port }}/tcp"
+
+    - name: Reload firewalld to apply rules
+      ansible.builtin.command: firewall-cmd --reload
+      changed_when: false
 
     - name: Show info
       debug:
         msg: |
-          ✅ Vault running on http://127.0.0.1:{{ vault_port }} (root token: {{ vault_token }})
-          ✅ Boundary running on http://127.0.0.1:{{ boundary_port }}
+          ✅ Vault running on http://{{ hashicorp_ip }}:{{ vault_port }} (root token: {{ vault_token }})
+          ✅ Boundary running on http://{{ hashicorp_ip }}:{{ boundary_port }}
           ✅ PostgreSQL for Boundary on port {{ db_port }}
-          ✅ Vault Transit key "boundary_root" created
+          ✅ Vault Transit key "{{ boundary_vault_transit_key }}" created

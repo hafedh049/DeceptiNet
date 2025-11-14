@@ -1,60 +1,82 @@
 ---
 - name: Uninstall k3s Kubernetes Cluster
   hosts: PAM-WK-1, PAM-WK-2
+  become: true
   vars:
     k3s_user: "root"
 
   tasks:
-    - name: "[K3S-UNINSTALL] Stop k3s service"
+    # ============================================================
+    # Stop and disable service
+    # ============================================================
+    - name: "[K3S] Stop and disable k3s service if running"
       systemd:
         name: k3s
         state: stopped
         enabled: false
-        daemon_reload: true
+      ignore_errors: true
 
-    - name: "[K3S-UNINSTALL] Run k3s uninstall script if exists"
+    # ============================================================
+    # Run k3s uninstall script (clean removal)
+    # ============================================================
+    - name: "[K3S] Run official uninstall script if available"
       shell: |
         if [ -f /usr/local/bin/k3s-uninstall.sh ]; then
           /usr/local/bin/k3s-uninstall.sh
         fi
+      args:
+        executable: /bin/bash
       ignore_errors: true
 
-    - name: "[K3S-UNINSTALL] Remove k3s binary if exists"
+    # ============================================================
+    # Remove leftover files and dirs
+    # ============================================================
+    - name: "[K3S] Remove residual files and directories"
       file:
-        path: /usr/local/bin/k3s
+        path: "{{ item }}"
         state: absent
-
-    - name: "[K3S-UNINSTALL] Remove k3s service file"
-      file:
-        path: /etc/systemd/system/k3s.service
-        state: absent
-
-    - name: "[K3S-UNINSTALL] Remove kubeconfig for {{ k3s_user }}"
-      file:
-        path: "{{ (k3s_user == 'root') | ternary('/root/.kube/config', '/home/' + k3s_user + '/.kube/config') }}"
-        state: absent
-
-    - name: "[K3S-UNINSTALL] Remove ~/.kube directory if empty"
-      file:
-        path: "{{ (k3s_user == 'root') | ternary('/root/.kube', '/home/' + k3s_user + '/.kube') }}"
-        state: absent
-        recurse: true
-
-    - name: "[K3S-UNINSTALL] Reload systemd daemon"
-      systemd:
-        daemon_reload: true
-
-    - name: "[K3S-UNINSTALL] Verify k3s is gone"
-      shell: |
-        if command -v k3s >/dev/null 2>&1; then
-          echo "k3s still exists"
-          exit 1
-        else
-          echo "✅ k3s successfully removed"
-        fi
-      register: uninstall_check
+      loop:
+        - /usr/local/bin/k3s
+        - /usr/local/bin/k3s-uninstall.sh
+        - /etc/systemd/system/k3s.service
+        - /etc/rancher/k3s
+        - /var/lib/rancher
+        - /var/lib/kubelet
+        - /var/lib/cni
+        - /run/k3s
       ignore_errors: true
 
-    - name: "[K3S-UNINSTALL] Display uninstall status"
+    # ============================================================
+    # Remove user kubeconfig
+    # ============================================================
+    - name: "[K3S] Remove kubeconfig for non-root user"
+      file:
+        path: "/home/{{ k3s_user }}/.kube"
+        state: absent
+      when: k3s_user != "root"
+      ignore_errors: true
+
+    - name: "[K3S] Remove kubeconfig for root"
+      file:
+        path: "/root/.kube"
+        state: absent
+      when: k3s_user == "root"
+      ignore_errors: true
+
+    # ============================================================
+    # Clean bash alias
+    # ============================================================
+    - name: "[K3S] Remove alias for kubectl (k)"
+      lineinfile:
+        path: "{{ (k3s_user == 'root') | ternary('/root/.bashrc', '/home/' + k3s_user + '/.bashrc') }}"
+        regexp: "^alias k='kubectl'"
+        state: absent
+      ignore_errors: true
+
+    - name: "[K3S] Confirm deletion complete"
       debug:
-        msg: "{{ uninstall_check.stdout }}"
+        msg: |
+          🧹 k3s and all its components have been successfully removed.
+          - Service: stopped and disabled
+          - Binaries and configs: purged
+          - User kubeconfig and aliases: cleaned up

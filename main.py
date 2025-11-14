@@ -17,6 +17,7 @@ BASE_VM_PATH = os.getenv("BASE_VM_PATH")
 BASE_VM_USERNAME = os.getenv("BASE_VM_USERNAME")
 BASE_VM_PASSWORD = os.getenv("BASE_VM_PASSWORD")
 
+
 # -------------------
 # Utility functions
 # -------------------
@@ -98,16 +99,6 @@ def copy_files(ssh, local_dir, remote_base_dir, vms=None):
                 with open(item, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
 
-                    # Replace VM IP placeholders
-                    if vms:
-                        for vm in vms:
-                            placeholder_key = f"{vm['name']}_IP"
-                            content = re.sub(
-                                r"\{\s*\{\s*" + re.escape(placeholder_key) + r"\s*\}\s*\}",
-                                vm["ip"],
-                                content,
-                            )
-
                     # Replace .env variables
                     for key, value in dotenv_values(".env").items():
                         content = re.sub(
@@ -115,6 +106,32 @@ def copy_files(ssh, local_dir, remote_base_dir, vms=None):
                             value,
                             content,
                         )
+
+                    content = re.sub(
+                        r"\{\s*\{\s*" + "N8N_IP" + r"\s*\}\s*\}",
+                        [vm for vm in vms if vm["name"] == "Blue"][0]["ip"],
+                        content,
+                    )
+                    content = re.sub(
+                        r"\{\s*\{\s*" + "CALDERA_IP" + r"\s*\}\s*\}",
+                        [vm for vm in vms if vm["name"] == "Red"][0]["ip"],
+                        content,
+                    )
+                    content = re.sub(
+                        r"\{\s*\{\s*" + "HONEYPOT_IP" + r"\s*\}\s*\}",
+                        [vm for vm in vms if vm["name"] == "T-Pot"][0]["ip"],
+                        content,
+                    )
+                    content = re.sub(
+                        r"\{\s*\{\s*" + "LOKI_IP" + r"\s*\}\s*\}",
+                        [vm for vm in vms if vm["name"] == "Blue"][0]["ip"],
+                        content,
+                    )
+                    content = re.sub(
+                        r"\{\s*\{\s*" + "OLLAMA_HOST" + r"\s*\}\s*\}",
+                        f"http://{'.'.join([vm for vm in vms if vm["name"] == "Blue"][0]["ip"].split('.')[:3])}.1:{os.getenv('OLLAMA_PORT')}",
+                        content,
+                    )
 
                 with sftp.file(remote_item, "w") as remote_file:
                     remote_file.write(content)
@@ -158,13 +175,14 @@ if __name__ == "__main__":
         "echo '[all]' | tee /root/inventory",
     ]
 
-    target_vms = [vm for vm in vms if vm["name"] != "Ansible" and vm.get("state") == "start"]
+    target_vms = [
+        vm for vm in vms if vm["name"] != "Ansible" and vm.get("state") == "start"
+    ]
     for vm in target_vms:
         safe_name = vm["name"].replace(" ", "-")
         port = int(os.getenv("T_POT_PORT")) if vm["name"] == "T-Pot" else 22
         commands.append(
             f"grep -q '{safe_name} ansible_host={vm['ip']}' /root/inventory || echo '{safe_name} ansible_host={vm['ip']} python_interpreter=/usr/bin/python3 ansible_port={port}' | tee -a /root/inventory"
-
         )
         commands.append(
             f"grep -q '{vm['ip']} {safe_name}' /etc/hosts || echo '{vm['ip']} {safe_name}' | tee -a /etc/hosts"

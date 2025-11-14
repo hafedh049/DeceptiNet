@@ -19,11 +19,6 @@
     grafana_username: "{{ GRAFANA_USER }}"
     grafana_password: "{{ GRAFANA_PASSWORD }}"
     discord_webhook: "{{ DISCORD_WEBHOOK }}"
-    mongo_container_name: "{{ MONGO_CONTAINER_NAME }}"
-    mongo_container_port: "{{ MONGO_CONTAINER_PORT }}"
-    mongo_database: "{{ MONGO_DB_NAME }}"
-    mongo_username: "{{ MONGO_USERNAME }}"
-    mongo_password: "{{ MONGO_PASSWORD }}"
 
   tasks:
     - name: "[N8N] Ensure required variables are defined"
@@ -39,12 +34,6 @@
           - grafana_password is defined
         fail_msg: "Missing one or more required n8n variables."
 
-    # Install sqlite3 for n8n
-    - name: "[N8N] Install sqlite3"
-      dnf:
-        name: sqlite3
-        state: present
-
     # ============================================================
     # n8n Installation and Workflow Setup
     # ============================================================
@@ -58,7 +47,7 @@
       file:
         path: "{{ workflows_dir }}"
         state: directory
-        mode: "0755"
+        mode: "0777"
 
     - name: Delete existing n8n container if it exists and its volume
       command: podman rm -f {{ n8n_container_name }} #&& podman volume rm -f {{ n8n_container_name }}_data
@@ -87,8 +76,8 @@
                 - N8N_PUBLIC_API_ENABLED=true
                 - WEBHOOK_URL={{ n8n_host }}:{{ n8n_port }}/
               volumes:
-                - data:/home/node/.n8n
-                - {{ workflows_dir }}:/workflows
+                - data:/home/node/.n8n:Z
+                - {{ workflows_dir }}:/workflows:Z
 
           volumes:
             data:
@@ -97,17 +86,17 @@
       dnf:
         name:
           - podman
-          - podman-compose
+          - podman-docker
+          - sqlite3
         state: present
 
-    - name: "[N8N] Enable and start Podman"
-      systemd:
-        name: podman
-        state: started
-        enabled: true
+    - name: Install Compose with pip
+      pip:
+        name: podman-compose
+        executable: pip3
 
     - name: "[N8N] Start n8n"
-      command: podman-compose -f "{{ n8n_dir }}/docker-compose.yml" up -d
+      command: /usr/local/bin/podman-compose -f "{{ n8n_dir }}/docker-compose.yml" up -d
       args:
         chdir: "{{ n8n_dir }}"
 
@@ -152,20 +141,6 @@
                 "port": "{{ honeypot_port }}",
                 "username": "{{ honeypot_ssh_username }}",
                 "password": "{{ honeypot_ssh_password }}"
-              }
-            },
-            {
-              "id": "3",
-              "name": "MongoDB Aegis",
-              "type": "mongoDb",
-              "data": {
-                "configurationType": "values",
-                "host": "{{ mongo_container_name }}",
-                "port": {{ mongo_container_port }},
-                "database": "{{ mongo_database }}",
-                "user": "{{ mongo_username }}",
-                "password": "{{ mongo_password }}",
-                "useTLS": false
               }
             }
           ]
@@ -235,7 +210,7 @@
               },
               {
                 "parameters": {
-                  "jsCode": "// Parse Loki response and prepare for AI analysis\nconst logsData = $input.first().json;\nconst srcIp = $('Fetch Loki Logs').first().json.src_ip;\n\nlet logEntries = [];\nif (logsData.data && logsData.data.result) {\n  logsData.data.result.forEach(result => {\n    if (result.values) {\n      result.values.forEach(value => {\n        // Escape only quotes and backslashes for JSON safety\n        let log = value[1];\n          logEntries.push(log);\n      });\n    }\n  });\n}\n\nconst logsText = logEntries.slice(0, 1).join('\\\\n');\n\n// Build prompt with minimal necessary escaping\nconst prompt = `Consider yourself a cybersecurity specialist and architect and determine if it's a real attack or not. Return ONLY valid JSON without (```json and \n) and with this structure: {\\\"is_attack\\\": boolean, \\\"confidence\\\": number(0-100 as integer), \\\"attack_type\\\": string (note empty even low confidence), \\\"threat_level\\\": \\\"low|medium|high|critical\\\", \\\"recommendation\\\": string (note empty even low confidence)}\\\\nNOTE: All fields are required and must have values no matter what is the confidence\\\\nSource IP: ${srcIp}\\\\nLogs: ${logsText}`;\n\n// Final escape for JSON string embedding\nconst escapedPrompt = prompt\n  .replace(/\\\\/g, '\\\\\\\\')\n  .replace(/\"/g, '\\\\\"');\n\nreturn {\n  model: \"phi4-mini:latest\",\n  prompt: escapedPrompt\n};"
+                  "jsCode": "// Parse Loki response and prepare for AI analysis\nconst logsData = $input.first().json;\nconst srcIp = $('Fetch Loki Logs').first().json.src_ip;\n\nlet logEntries = [];\nif (logsData.data && logsData.data.result) {\n  logsData.data.result.forEach(result => {\n    if (result.values) {\n      result.values.forEach(value => {\n        // Escape only quotes and backslashes for JSON safety\n        let log = value[1];\n          logEntries.push(log);\n      });\n    }\n  });\n}\n\nconst logsText = logEntries.slice(0, 1).join('\\\\n');\n\n// Build prompt with minimal necessary escaping\nconst prompt = `Consider yourself a cybersecurity specialist and architect and determine if it's a real attack or not. Return ONLY valid JSON without (backticks, json word and \n delimiter) and with this structure: {\\\"is_attack\\\": boolean, \\\"confidence\\\": number(0-100 as integer), \\\"attack_type\\\": string (note empty even low confidence), \\\"threat_level\\\": \\\"low|medium|high|critical\\\", \\\"recommendation\\\": string (note empty even low confidence)}\\\\nNOTE: All fields are required and must have values no matter what is the confidence\\\\nSource IP: ${srcIp}\\\\nLogs: ${logsText}`;\n\n// Final escape for JSON string embedding\nconst escapedPrompt = prompt\n  .replace(/\\\\/g, '\\\\\\\\')\n  .replace(/\"/g, '\\\\\"');\n\nreturn {\n  model: \"phi4-mini:latest\",\n  prompt: escapedPrompt\n};"
                 },
                 "name": "Prepare AI Prompt",
                 "type": "n8n-nodes-base.code",
@@ -310,44 +285,13 @@
               },
               {
                 "parameters": {
-                  "operation": "insert",
-                  "collection": "alerts",
-                  "document": {
-                    "timestamp": "={{ $json.timestamp }}",
-                    "alert_name": "={{ $json.alert_name }}",
-                    "alert_description": "={{ $json.alert_description }}",
-                    "source_ip": "={{ $json.source_ip }}",
-                    "should_block": "={{ $json.should_block }}",
-                    "block_reason": "={{ $json.block_reason }}",
-                    "is_attack": "={{ $json.is_attack }}",
-                    "confidence": "={{ $json.confidence }}",
-                    "attack_type": "={{ $json.attack_type }}",
-                    "severity": "={{ $json.severity }}",
-                    "recommendation": "={{ $json.recommendation }}",
-                    "logs": "={{ $json.logs }}"
-                  },
-                  "options": {}
-                },
-                "name": "Save Alert to MongoDB",
-                "type": "n8n-nodes-base.mongoDb",
-                "typeVersion": 1,
-                "position": [1900, 200],
-                "credentials": {
-                  "mongoDb": {
-                    "id": "3",
-                    "name": "MongoDB Aegis"
-                  }
-                }
-              },
-              {
-                "parameters": {
                   "command": "=sudo iptables -A INPUT -s '{{ $json.source_ip }}' -j DROP && echo '{{ $json.source_ip }}' >> /var/log/blocked_ips.txt",
                   "workingDirectory": "/"
                 },
                 "name": "Block Attacker IP",
                 "type": "n8n-nodes-base.ssh",
                 "typeVersion": 1,
-                "position": [2100, 200],
+                "position": [1900, 200],
                 "credentials": {
                   "sshPassword": {
                     "id": "2",
@@ -363,7 +307,7 @@
                 "name": "Discord - Critical Alert",
                 "type": "n8n-nodes-base.discord",
                 "typeVersion": 2,
-                "position": [2300, 200],
+                "position": [2100, 200],
                 "credentials": {
                   "discordWebhookApi": {
                     "id": "1",
@@ -459,7 +403,7 @@
                 "main": [
                   [
                     {
-                      "node": "Save Alert to MongoDB",
+                      "node": "Block Attacker IP",
                       "type": "main",
                       "index": 0
                     }
@@ -467,17 +411,6 @@
                   [
                     {
                       "node": "Discord - False Positive",
-                      "type": "main",
-                      "index": 0
-                    }
-                  ]
-                ]
-              },
-              "Save Alert to MongoDB": {
-                "main": [
-                  [
-                    {
-                      "node": "Block Attacker IP",
                       "type": "main",
                       "index": 0
                     }

@@ -18,30 +18,36 @@
 
   tasks:
     # ---------------- Podman Deployment ----------------
-    - name: Install dnf dependencies
-      dnf:
+    - name: Install package dependencies
+      package:
         name:
           - python3-pip
           - podman
-          - podman-compose
+          - podman-docker
           - jq
           - curl
-        state: present
-      when: inventory_hostname == "Caldera"
+        state: latest
+      when: inventory_hostname == "Red"
+
+    - name: Install Compose with pip
+      pip:
+        name: podman-compose
+        executable: pip3
+      when: inventory_hostname == "Red"
 
     - name: Ensure podman is ready (no daemon required)
       shell: podman info
       register: podman_info
       changed_when: false
       failed_when: podman_info.rc != 0
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Ensure caldera directory exists
       file:
         path: "{{ caldera_dir }}"
         state: directory
         mode: "0755"
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Create Podman Compose file (Caldera)
       copy:
@@ -55,44 +61,44 @@
               restart: always
               ports:
                 - "{{ caldera_port }}:{{ caldera_port }}"
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Launch Caldera Compose (Podman) if not running
       shell: |
         if ! podman ps --format '{{'{{.Names}}'}}' | grep -w "{{ caldera_container_name }}"; then
-          podman-compose up -d
+          /usr/local/bin/podman-compose up -d
         fi
       args:
         chdir: "{{ caldera_dir }}"
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Wait briefly for Caldera to start
       pause:
         seconds: 10
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     # Patch local.yml
     - name: Copy current local.yml from container if exists
       command: podman cp {{ caldera_container_name }}:/usr/src/app/conf/local.yml {{ caldera_dir }}/local.yml
       register: cp_local
       ignore_errors: true
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Slurp original local.yml if exists
       slurp:
         src: "{{ caldera_dir }}/local.yml"
       register: original_local_slurp
-      when: inventory_hostname == "Caldera" and cp_local is succeeded
+      when: inventory_hostname == "Red" and cp_local is succeeded
 
     - name: Decode original local.yml
       set_fact:
         original_local_raw: "{{ original_local_slurp.content | b64decode }}"
-      when: inventory_hostname == "Caldera" and original_local_slurp is defined and original_local_slurp.content is defined
+      when: inventory_hostname == "Red" and original_local_slurp is defined and original_local_slurp.content is defined
 
     - name: Parse original local.yml as YAML
       set_fact:
         original_local_dict: "{{ original_local_raw | from_yaml }}"
-      when: inventory_hostname == "Caldera" and original_local_raw is defined
+      when: inventory_hostname == "Red" and original_local_raw is defined
 
     - name: Patch HTTP + users + API keys
       set_fact:
@@ -113,7 +119,7 @@
               'api_key_blue': caldera_blue_api_key
             }, recursive=True)
           }}
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Render patched_local.yml on host
       copy:
@@ -121,15 +127,15 @@
         content: "{{ patched_local_dict | to_nice_yaml(indent=2) }}"
         mode: "0600"
         force: yes
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Push patched local.yml into container
       command: podman cp {{ caldera_dir }}/patched_local.yml {{ caldera_container_name }}:/usr/src/app/conf/local.yml
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Restart Caldera container
       command: podman restart {{ caldera_container_name }}
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Wait for Caldera HTTP to respond
       uri:
@@ -142,7 +148,7 @@
       retries: 30
       delay: 5
       until: caldera_response_after_patch is succeeded
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Extract creds & API keys
       set_fact:
@@ -158,18 +164,18 @@
               username: "blue"
               password: "{{ patched_local_dict.users.blue.blue }}"
               api_key: "{{ patched_local_dict.api_key_blue }}"
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Save secrets.json
       copy:
         dest: "{{ caldera_dir }}/secrets.json"
         content: "{{ extracted_data | to_nice_json(indent=2) }}"
         mode: "0600"
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     # ---------------- Deploy agent on T-Pot ----------------
     - name: Ensure python3 and pip are installed on T-Pot
-      dnf:
+      package:
         name:
           - python3
           - python3-pip
@@ -189,8 +195,142 @@
         mode: "0755"
         content: |
           #!/usr/bin/env python3
-          # Caldera agent script (same as original)
-          ...
+          #!/usr/bin/env python3
+          # Caldera HTTP-contact agent with PAW persistence - SYSTEMD COMPATIBLE
+          import time, json, base64, socket, os, requests, netifaces, pwd, sys
+
+          CALDERA_SERVER = "http://{{ hostvars['Red']['ansible_default_ipv4']['address'] }}:{{ caldera_port }}"
+          API_KEY = "{{ caldera_red_api_key }}"
+          AGENT_NAME = "T-Pot-{{ ansible_hostname }}"
+          SLEEP = 30
+          PAW_FILE = "/etc/caldera/agent_paw.json"
+
+          def get_username():
+              """Get current username reliably in systemd environment"""
+              try:
+                  # Method 1: Get effective user ID (ALWAYS works)
+                  uid = os.geteuid()
+                  return pwd.getpwuid(uid).pw_name
+              except Exception as e:
+                  print(f"Warning: Could not get username via geteuid(): {e}")
+                  return "root"  # Fallback to root since service runs as root
+
+          def get_home_directory():
+              """Get home directory reliably in systemd environment"""
+              try:
+                  # Method 1: Get from password database
+                  uid = os.geteuid()
+                  return pwd.getpwuid(uid).pw_dir
+              except Exception:
+                  return "/root"  # Fallback
+
+          def debug_environment():
+              """Debug information to understand the runtime environment"""
+              print("=== ENVIRONMENT DEBUG ===")
+              print(f"PID: {os.getpid()}")
+              print(f"UID: {os.getuid()}, EUID: {os.geteuid()}")
+              print(f"GID: {os.getgid()}, EGID: {os.getegid()}")
+              print(f"CWD: {os.getcwd()}")
+              print(f"Python path: {sys.executable}")
+              print(f"USER env: {os.getenv('USER', 'NOT SET')}")
+              print(f"HOME env: {os.getenv('HOME', 'NOT SET')}")
+              print("=========================")
+
+          def load_paw():
+              """Load PAW from persistent storage"""
+              try:
+                  if os.path.exists(PAW_FILE):
+                      with open(PAW_FILE, 'r') as f:
+                          data = json.load(f)
+                          paw = data.get('paw')
+                          if paw:
+                              print(f"Loaded existing PAW: {paw}")
+                              return paw
+              except Exception as e:
+                  print(f"Error loading PAW: {e}")
+              return None
+
+          def save_paw(paw):
+              """Save PAW to persistent storage"""
+              try:
+                  with open(PAW_FILE, 'w') as f:
+                      json.dump({'paw': paw, 'agent_name': AGENT_NAME}, f)
+                  os.chmod(PAW_FILE, 0o600)
+                  print(f"Saved PAW: {paw}")
+              except Exception as e:
+                  print(f"Failed to save PAW: {e}")
+
+          def get_ips():
+              ips = []
+              for iface in netifaces.interfaces():
+                  for a in netifaces.ifaddresses(iface).get(netifaces.AF_INET, []):
+                      ip = a.get("addr")
+                      if ip and not ip.startswith("127."):
+                          ips.append(ip)
+              try:
+                  # fallback to hostname resolution
+                  ips.append(socket.gethostbyname(socket.gethostname()))
+              except Exception:
+                  pass
+              return list(dict.fromkeys(ips))
+
+          def make_profile(paw=None):
+              prof = {
+                  "server": CALDERA_SERVER,
+                  "platform": "linux",
+                  "host": socket.gethostname(),
+                  "group": "red",
+                  "executors": ["sh"],
+                  "exe_name": "agent-linux",
+                  "host_ip_addrs": get_ips(),
+                  "username": get_username(),
+                  "location": get_home_directory(),
+                  "display_name": AGENT_NAME
+              }
+              if paw:
+                  prof["paw"] = paw
+              return base64.b64encode(json.dumps(prof).encode()).decode()
+
+          def beacon(paw=None):
+              data = make_profile(paw)
+              headers = {"KEY": API_KEY, "Content-Type": "text/plain"}
+              print(f"Sending beacon to {CALDERA_SERVER}")
+              resp = requests.post(f"{CALDERA_SERVER}/beacon", data=data, headers=headers, timeout=15)
+              return resp
+
+          if __name__ == "__main__":
+              print("=== CALDERA AGENT STARTING (SYSTEMD COMPATIBLE) ===")
+              debug_environment()
+              
+              # Try to load existing PAW first
+              paw = load_paw()
+              print(f"Starting agent with PAW: {paw}")
+              
+              beacon_count = 0
+              while True:
+                  beacon_count += 1
+                  print(f"=== Beacon attempt #{beacon_count} ===")
+                  try:
+                      r = beacon(paw)
+                      print(f"Beacon status: {r.status_code}")
+                      if r.status_code in (200, 201):
+                          try:
+                              decoded = base64.b64decode(r.content).decode()
+                              print(f"Response received: {decoded}")
+                              job = json.loads(decoded)
+                              new_paw = job.get("paw")
+                              if new_paw and new_paw != paw:
+                                  paw = new_paw
+                                  save_paw(paw)
+                                  print(f"Updated to new PAW: {paw}")
+                          except Exception as e:
+                              print(f"Failed to decode/parse response: {e}")
+                      else:
+                          print(f"Beacon response text: {r.text}")
+                  except Exception as e:
+                      print(f"Beacon failed: {e}")
+                      print(f"Error type: {type(e).__name__}")
+                  time.sleep(SLEEP)
       when: inventory_hostname == "T-Pot"
 
     - name: Install required python packages on T-Pot
@@ -250,19 +390,19 @@
       retries: 20
       delay: 10
       changed_when: false
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Set final agent PAW
       set_fact:
         final_agent_paw: "{{ agent_paw_check.stdout }}"
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Update T-Pot agent with obtained PAW
       copy:
         dest: /etc/caldera/agent_paw.json
         content: |
           {
-            "paw": "{{ hostvars['Caldera']['final_agent_paw'] }}",
+            "paw": "{{ hostvars['Red']['final_agent_paw'] }}",
             "agent_name": "T-Pot-{{ ansible_hostname }}"
           }
         mode: "0600"
@@ -281,7 +421,7 @@
           Display Name: T-Pot-{{ hostvars['T-Pot']['ansible_hostname'] }}
           PAW: {{ final_agent_paw }}
           Caldera Server: {{ caldera_host }}:{{ caldera_port }}
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     # ---------------- Verify agent ----------------
     - name: Verify agent is active in Caldera
@@ -292,9 +432,9 @@
           '.[] | select(.host==$NAME) | {paw: .paw, last_seen: .last_seen, platform: .platform, status: .status}'
       register: agent_verify
       changed_when: false
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"
 
     - name: Show agent verification details
       debug:
         var: agent_verify.stdout
-      when: inventory_hostname == "Caldera"
+      when: inventory_hostname == "Red"

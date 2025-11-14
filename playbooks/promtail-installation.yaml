@@ -15,7 +15,7 @@
         mode: "0755"
 
     - name: "[PROMTAIL] Pull Promtail image"
-      command: podman pull "{{ promtail_image }}"
+      command: docker pull "{{ promtail_image }}"
 
     - name: "[PROMTAIL] Create Promtail config file"
       copy:
@@ -29,7 +29,7 @@
             filename: /tmp/positions.yaml
 
           clients:
-            - url: "http://{{ hostvars['Arsenal']['ansible_host'] }}:{{ loki_port }}/loki/api/v1/push"
+            - url: "http://{{ hostvars['Blue']['ansible_host'] }}:{{ loki_port }}/loki/api/v1/push"
 
           scrape_configs:
             - job_name: varlogs
@@ -63,24 +63,17 @@
                 - labels:
                     src_ip:
 
-    - name: "[PROMTAIL] Kill promtail process if running"
-      shell: |
-        pid=$(podman inspect --format '{{'{{' }}.State.Pid{{ '}}' }}' {{ promtail_container_name }} 2>/dev/null || echo "")
-        if [ -n "$pid" ]; then
-          kill -9 $pid || true
-        fi
-
     - name: "[PROMTAIL] Stop existing Promtail container if running"
-      command: podman rm -f "{{ promtail_container_name }}"
+      command: docker rm -f "{{ promtail_container_name }}"
 
-    - name: "[PROMTAIL] Start Promtail with Podman run command"
+    - name: "[PROMTAIL] Start Promtail with docker run command"
       command: >
-        podman run -d
+        docker run -d
         --name {{ promtail_container_name }}
         --restart unless-stopped
         --network host
-        -v /home/core/tpotce/data:/home/core/tpotce/data:ro
-        -v {{ promtail_dir }}/config.yml:/etc/promtail/config.yml:ro
+        -v /home/core/tpotce/data:/home/core/tpotce/data:rw,Z
+        -v {{ promtail_dir }}/config.yml:/etc/promtail/config.yml:rw,Z
         {{ promtail_image }}
         -config.file=/etc/promtail/config.yml
       args:
@@ -99,6 +92,6 @@
           ✅ Promtail is running on {{ inventory_hostname }}.
           - Container: {{ promtail_container_name }}
           - Image: {{ promtail_image }}
-          - Shipping logs to Loki at: {{ hostvars['Arsenal']['ansible_host'] }}:{{ loki_port }}
+          - Shipping logs to Loki at: {{ hostvars['Blue']['ansible_host'] }}:{{ loki_port }}
           - Config: /opt/promtail/config.yml
           - Logs scraped
